@@ -1,0 +1,31 @@
+今日日期：{today}
+
+法规名称：{title}
+官方链接：{url}
+适用市场：{market}
+相关性说明：{relevance}
+
+⚠️ 以下内容由 Gemini 通过 Google Search 合成（非官方原文）：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{scraped_text}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+合规分析仍按主分析 schema 输出；适用的额外降级约束见系统提示。
+
+输出严格 JSON（单个对象）：
+{{
+  "requirement":     "中文 3–5 条要点（每条以数字编号）",
+  "dates": {{
+    "publish":            "YYYY-MM-DD 或 null",
+    "effective":          "YYYY-MM-DD 或 null",
+    "enforcements": [{{"date": "YYYY-MM-DD", "scope": "..."}}],
+    "consultation_close": "YYYY-MM-DD 或 null"
+  }},
+  "deadline":        "YYYY-MM-DD 或 null",
+  "importance":      "🟡 或 🟢",
+  "importance_note": "「阶段N + CX → 档位」",
+  "worst_case":      "字符串；合成资料未提及时填「待确认」",
+  "business_impact": "对我司影响要点（仅基于合成资料明确提及的信息）",
+  "affected_products": "从以下选项选出：{product_list}；均不适用填不相关",
+  "affected_markets":  "受影响市场（按系统提示规范）"
+}}

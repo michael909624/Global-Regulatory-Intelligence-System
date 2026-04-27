@@ -14,13 +14,10 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import threading
-import time
 from datetime import datetime, timedelta
 
-from google import genai
-from google.genai import types
-
-from config import GEMINI_API_KEY
+import ai_client
+import prompts
 from database import init_db, get_connection
 from utils import get_logger, parse_json_array, reg_hash
 
@@ -102,37 +99,10 @@ CATEGORY_GROUPS: dict[str, list[str]] = {
     ],
 }
 
-# ── Gemini 客户端 ─────────────────────────────────────────────────────────────
+# ── 调用参数 ──────────────────────────────────────────────────────────────────
 
-RESEARCH_MODEL = "gemini-flash-latest"
-MAX_RETRIES    = 2
-CALL_TIMEOUT   = 90      # 单任务超时（秒）
-
-_client: genai.Client | None = None
-_client_lock = threading.Lock()
+CALL_TIMEOUT = 90      # 单任务超时（秒）
 _db_lock     = threading.Lock()
-
-
-def _get_client() -> genai.Client:
-    global _client
-    with _client_lock:
-        if _client is None:
-            _client = genai.Client(api_key=GEMINI_API_KEY)
-    return _client
-
-
-# ── 系统提示 ──────────────────────────────────────────────────────────────────
-
-_SYSTEM = """\
-你是轻型电动出行设备（LEV）及关键零部件的监管情报侦察员。
-
-关注产品：
-  整机：电动滑板车、电动平衡车、电助力自行车、电动摩托车、智能割草机
-  零部件：锂电池组、电机驱动系统、控制器、充电器、BMS 电池管理系统
-
-唯一任务：发现相关法规/标准的官方动态，返回正式名称、官方链接、适用市场。
-不做合规解读，不评估影响等级，不提炼行动要点，不格式化排版。
-"""
 
 
 # ── 全球（按维度）──────────────────────────────────────────────────────────────
@@ -148,23 +118,6 @@ def _subtopics_block(subtopics: list[str]) -> str:
     return "\n".join(f"  {i+1}. {s}" for i, s in enumerate(subtopics))
 
 
-def _output_schema_block() -> str:
-    return """\
-若确实无相关动态 → 输出 []
-有动态 → 输出严格 JSON 数组，不含 markdown 代码块，不含 [1][2] 等引用标记：
-
-[
-  {
-    "title_original": "法规/标准的正式官方名称（原始语言，如 Regulation (EU) 2023/1542）",
-    "title_cn":       "≤20 字中文简标题（用于报表显示）",
-    "url":            "官方原文最权威链接（官方公报/政府/标准机构）；无法确认则 null",
-    "market_hint":    "主要适用市场（多个用顿号分隔）",
-    "relevance_note": "一句话说明与我司产品的关联"
-  }
-]
-"""
-
-
 def _build_global_prompt(dim_id: int, quick: bool) -> str:
     today     = datetime.now().strftime("%Y-%m-%d")
     start_new = (datetime.now() - timedelta(days=NEW_PUBLICATION_DAYS)).strftime("%Y-%m-%d")
@@ -172,100 +125,43 @@ def _build_global_prompt(dim_id: int, quick: bool) -> str:
     dim       = DIMENSIONS[dim_id]
 
     if quick:
-        scope = (
-            f"请通过网络搜索，找出过去 {NEW_PUBLICATION_DAYS} 天内（{start_new} 之后）"
-            f"新发布或修订的官方法规、标准或公告。\n\n"
-            f"补充：对于本维度涉及的重大监管框架（EU AI Act、EU Battery Regulation、CRA 等），\n"
-            f"即使法规本体超过 {NEW_PUBLICATION_DAYS} 天，只要有新的实施细则/委托法规/执行标准发布、\n"
-            f"或主管机构发布执法指南/合规通知，也必须纳入输出。"
+        scope = prompts.load("researcher_scope_quick").format(
+            new_days=NEW_PUBLICATION_DAYS,
+            start_new=start_new,
         )
     else:
-        scope = (
-            f"请通过网络搜索，找出满足以下任一条件的官方动态：\n"
-            f"  A）过去 {NEW_PUBLICATION_DAYS} 天内（{start_new} 之后）新发布或修订的官方法规、标准或公告\n"
-            f"  B）未来 {UPCOMING_DEADLINE_DAYS} 天内（截止 {end_up}）即将生效或过渡期结束的存量法规\n\n"
-            f"补充：对于本维度涉及的重大监管框架（EU AI Act、EU Battery Regulation、CRA 等），\n"
-            f"即使法规本体超过 {NEW_PUBLICATION_DAYS} 天，只要存在以下任一情形也必须纳入：\n"
-            f"  • 新的实施细则/委托法规/执行标准发布\n"
-            f"  • 截止日期在未来 {UPCOMING_DEADLINE_DAYS} 天内\n"
-            f"  • 主管机构发布执法指南/合规通知"
+        scope = prompts.load("researcher_scope_full").format(
+            new_days=NEW_PUBLICATION_DAYS,
+            start_new=start_new,
+            upcoming_days=UPCOMING_DEADLINE_DAYS,
+            end_up=end_up,
         )
 
-    return f"""\
-今日日期：{today}
-
-搜索范围：全球（不预设市场，自行发现所有相关司法管辖区）
-
-重点覆盖（请按法域使用其本地官方语言进行查询，仅靠英文关键词会显著漏召回）：
-  • 欧盟 + 成员国：英文 + 各成员国官方语言（DE / FR / IT / ES / NL / PL 等）
-        机构示例：欧盟委员会、CENELEC、ETSI；DIN（DE）、AFNOR（FR）、UNI（IT）
-  • 英国：英文；机构：UK gov、BSI、OPSS
-  • 美国：英文（联邦 + 各州；CPSC、NHTSA、FCC、Federal Register、各州公报）
-  • 加拿大：英文 + 法文（联邦 + 各省；CPSA、Health Canada、Transport Canada）
-  • 澳新：英文（ACCC、EESS、Standards Australia / NZ）
-  • 日本：日本語（METI 経産省、MLIT 国交省、NITE、消費者庁；
-        PSE 認証 / 電気用品安全法、道路交通法、消防法、技術基準適合証明）
-  • 韩国：한국어（MOTIE 산업통상자원부、MOLIT 국토교통부、KCC、KATS；
-        KC 인증 / 전기용품 및 생활용품 안전관리법、도로교통법）
-  • 俄罗斯 / 欧亚经济联盟：русский（ЕЭК Евразийская экономическая комиссия、Росстандарт；
-        ТР ЕАЭС 技术法规、ГОСТ 标准、СанПиН）
-  • 东南亚、印度、中东、南美等新兴市场：可用英文 + 当地语言
-
-请基于产品类型与法域特点，自行选用最匹配的本地语言关键词进行搜索。
-日韩俄等非英语法域的本地语言查询是必要项，不可跳过。
-
-监管维度：{dim['name']}
-维度子项（必须逐一检索，确保每个子项都至少做过一次查询）：
-{_subtopics_block(dim['subtopics'])}
-
-产品覆盖范围（整机 + 零部件，均需考虑）：
-{_category_block()}
-
-搜索任务：
-{scope}
-
-仅纳入：官方公报、政府公告、标准机构发布、型式认证变更、执法通告
-排除：新闻报道、行业分析、企业 ESG 报告、非官方解读
-
-{_output_schema_block()}"""
+    return prompts.load("researcher_global").format(
+        today=today,
+        dim_name=dim["name"],
+        subtopics_block=_subtopics_block(dim["subtopics"]),
+        category_block=_category_block(),
+        scope=scope,
+        output_schema=prompts.load("researcher_output_schema"),
+    )
 
 
 # ── Gemini grounding 调用 ─────────────────────────────────────────────────────
+# 发现层:高 temperature 最大化召回率(混沌搜索)。
+# 一致性靠下游去重 + 累积数据库,不靠单次调用稳定。
 
 def _call(prompt: str) -> tuple[str, list[dict]]:
-    cfg = types.GenerateContentConfig(
-        tools=[types.Tool(google_search=types.GoogleSearch())],
-        system_instruction=_SYSTEM,
+    return ai_client.call_grounded(
+        prompt,
+        system=prompts.load("researcher_system"),
+        # temperature / top_p 用 ai_client 的默认值(1.0 / 0.95)
     )
-    last_err: Exception | None = None
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            resp = _get_client().models.generate_content(
-                model=RESEARCH_MODEL,
-                contents=prompt,
-                config=cfg,
-            )
-            text = resp.text or ""
-            sources: list[dict] = []
-            try:
-                meta   = resp.candidates[0].grounding_metadata
-                chunks = (meta.grounding_chunks or []) if meta else []
-                for c in chunks:
-                    if c.web:
-                        sources.append({"url": c.web.uri or "", "title": c.web.title or ""})
-            except (IndexError, AttributeError):
-                pass
-            return text, sources
-        except Exception as e:
-            last_err = e
-            if attempt < MAX_RETRIES:
-                time.sleep(8 * (attempt + 1))
-    raise RuntimeError(f"API call failed: {last_err}")
 
 
 # ── 入库 ───────────────────────────────────────────────────────────────────────
 
-def _store(reg: dict, sources: list[dict], market: str = "") -> bool:
+def _store(reg: dict, sources: list[dict]) -> bool:
     """保存一条发现到 raw_search_results；按 reg_hash(title) 去重。"""
     title = (reg.get("title_original") or reg.get("title") or "").strip()
     if not title:
@@ -311,19 +207,19 @@ def _store(reg: dict, sources: list[dict], market: str = "") -> bool:
                 rep_url = ""
             fallback_json = json.dumps(fallbacks[:5], ensure_ascii=False) if fallbacks else None
 
-            market_hint  = (reg.get("market_hint") or market or "").strip()
+            market_hint  = (reg.get("market_hint") or "").strip()
             relevance    = (reg.get("relevance_note") or "").strip()
 
             conn.execute("""
                 INSERT OR IGNORE INTO raw_search_results
                     (query_date, source_url, title, title_cn, snippet, priority,
-                     product_category, market, raw_text, content_hash, scrape_status,
+                     product_category, market, content_hash, scrape_status,
                      fallback_urls)
-                VALUES (?,?,?,?,?,'高',null,?,?,?,'待抓取',?)
+                VALUES (?,?,?,?,?,'高',null,?,?,'待抓取',?)
             """, (
                 datetime.now().isoformat(),
                 rep_url, title, title_cn, relevance[:500], market_hint,
-                relevance[:200], h, fallback_json,
+                h, fallback_json,
             ))
             return bool(conn.execute("SELECT changes()").fetchone()[0])
 
@@ -334,28 +230,36 @@ def run_research(quick: bool = False) -> tuple[int, int]:
     """
     并发执行 4 个 Gemini 调用（D1–D4 各一次），入库到 raw_search_results。
     每个调用内由模型自行用各法域本地语言（含日韩俄）查询。
-    返回 (inserted, skipped)。
+    开始前先注入种子库(seeds.py)做保底召回。
+    返回 (inserted, skipped) — 含种子注入数量。
     """
     init_db()
 
-    tasks: list[tuple[str, str, str]] = [
-        (_build_global_prompt(dim_id, quick), "", f"全球 · {dim['name']}")
+    # 种子保底:不依赖 AI,先把已知权威源塞进队列。
+    from seeds import inject_seeds, SEEDS
+    seed_in, seed_skip = inject_seeds()
+    print(f"\n  种子库:{len(SEEDS)} 条 → 新增 {seed_in},已存在跳过 {seed_skip}")
+
+    tasks: list[tuple[str, str]] = [
+        (_build_global_prompt(dim_id, quick), f"全球 · {dim['name']}")
         for dim_id, dim in DIMENSIONS.items()
     ]
 
     total = len(tasks)
-    inserted = skipped = failed = 0
+    inserted = seed_in
+    skipped  = seed_skip
+    failed   = 0
     mode = "快速（仅新发布）" if quick else "全量（新发布 + 即将生效）"
 
     print(f"\n  模式：{mode}")
     print(f"  共 {total} 个任务（D1–D4 维度，AI 自行按法域适配本地语言）\n")
 
-    def _process_task(prompt: str, market: str) -> tuple[int, int, int]:
+    def _process_task(prompt: str) -> tuple[int, int, int]:
         text, srcs = _call(prompt)
         regs       = parse_json_array(text) or []
         n_in = n_sk = 0
         for reg in regs:
-            if isinstance(reg, dict) and _store(reg, srcs, market):
+            if isinstance(reg, dict) and _store(reg, srcs):
                 n_in += 1
             else:
                 n_sk += 1
@@ -367,8 +271,8 @@ def run_research(quick: bool = False) -> tuple[int, int]:
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=5, thread_name_prefix="researcher"
     ) as executor:
-        for prompt, market, label in tasks:
-            fut = executor.submit(_process_task, prompt, market)
+        for prompt, label in tasks:
+            fut = executor.submit(_process_task, prompt)
             future_to_label[fut] = label
 
         for fut in concurrent.futures.as_completed(future_to_label):

@@ -20,7 +20,7 @@ HELP = """
   run               完整流水线：发现 → 抓取 → 分析 → 报告（4步）
   run --quick       快速模式：仅搜索近 90 天新发布
 
-  research          Gemini 发现层：搜索并入库待抓取 URL（7次调用）
+  research          Gemini 发现层：搜索并入库待抓取 URL（D1–D4 共 4 次调用）
   research --quick  快速模式（仅新发布窗口）
 
   scrape            抓取待处理 URL 的网页/PDF 原文
@@ -54,6 +54,9 @@ HELP = """
 
   init              初始化数据库（首次使用时运行）
 
+  seed              注入种子源（已知权威源 URL 列表，保底召回）
+  evaluate          对照 tests/gold_set.json 黄金集计算召回率
+
 ━━━  典型工作流  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   每周深度扫描：    python3 gris.py run
@@ -78,14 +81,11 @@ def cmd_research(args: list[str]):
 
 def cmd_backfill(args: list[str]):
     """Ask Gemini to fill in missing source URLs for existing DB entries."""
-    import time, json
+    import time
     from database import get_connection, init_db
-    from google import genai
-    from google.genai import types
-    from config import GEMINI_API_KEY
+    import ai_client
 
     init_db()
-    client = genai.Client(api_key=GEMINI_API_KEY)
 
     with get_connection() as conn:
         rows = conn.execute("""
@@ -102,6 +102,7 @@ def cmd_backfill(args: list[str]):
 
     print(f"共 {len(rows)} 条缺少来源 URL，开始 Gemini 补全...\n")
     updated = 0
+    backfill_system = "你是法规链接补全助手,只输出最权威的官方原文 URL,不要解释。"
 
     for i, (raw_id, title, markets) in enumerate(rows, 1):
         prompt = (
@@ -111,14 +112,14 @@ def cmd_backfill(args: list[str]):
             "只输出 URL 本身，不含任何解释。若无法确认则输出 null。"
         )
         try:
-            resp = client.models.generate_content(
-                model="gemini-flash-latest",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    tools=[types.Tool(google_search=types.GoogleSearch())],
-                ),
+            text, _ = ai_client.call_grounded(
+                prompt,
+                system=backfill_system,
+                temperature=0.0,
+                top_p=None,
+                return_sources=False,
             )
-            url = (resp.text or "").strip().strip('"').strip("'")
+            url = text.strip().strip('"').strip("'")
             if url and url.lower() != "null" and url.startswith("http"):
                 with get_connection() as conn:
                     conn.execute(
@@ -441,6 +442,16 @@ def cmd_init(_args: list[str]):
     print("数据库初始化完成。")
 
 
+def cmd_seed(_args: list[str]):
+    from seeds import run_seed_command
+    run_seed_command()
+
+
+def cmd_evaluate(_args: list[str]):
+    from evaluate import run_evaluate_command
+    run_evaluate_command()
+
+
 # ── 交互菜单 ──────────────────────────────────────────────────────────────────
 
 # (command | None=separator, display description)
@@ -460,6 +471,8 @@ _MENU: list[tuple[str, str] | None] = [
     ("reanalyze","重置「不相关」条目并立即重新分析"),
     ("reset",    "清空数据  附加参数：--db  --reports（默认全部）"),
     ("init",     "初始化数据库（首次使用时运行）"),
+    ("seed",     "注入种子源(已知权威源 URL 列表，保底召回)"),
+    ("evaluate", "对照黄金集计算召回率(tests/gold_set.json)"),
 ]
 
 _NUMBERED = [e for e in _MENU if e is not None]  # for index lookup
@@ -544,6 +557,8 @@ COMMANDS = {
     "reanalyze": cmd_reanalyze,
     "reset":     cmd_reset,
     "init":      cmd_init,
+    "seed":      cmd_seed,
+    "evaluate":  cmd_evaluate,
     "menu":      cmd_menu,
 }
 

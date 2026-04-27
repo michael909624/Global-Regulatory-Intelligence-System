@@ -16,6 +16,7 @@ LOGS_DIR    = _os.path.join(_BASE, "logs")
 
 # ── Product lines ─────────────────────────────────────────────────────────────
 # Single source of truth. When adding a new product, append it here.
+# VALID_PRODUCTS 在 classify.py 派生（避免重复定义）。
 PRODUCT_LINES = [
     "电动滑板车",
     "电动平衡车",
@@ -24,14 +25,3 @@ PRODUCT_LINES = [
     "智能割草机",
 ]
 # 注：共享电动滑板车已并入"电动滑板车"，不再单独列出
-
-# 关键零部件（独立搜索槽，合规义务最终归因到整机产品线）
-COMPONENT_LINES = [
-    "锂电池组",
-    "电机驱动系统",
-    "控制器",
-    "充电器",
-    "BMS电池管理系统",
-]
-
-VALID_PRODUCTS = set(PRODUCT_LINES)

@@ -1,0 +1,55 @@
+{
+  "_meta": {
+    "description": "黄金集 — 系统应该发现的法规清单。每次跑 evaluate 计算召回率。",
+    "usage": "维护方法:每月手工添加 5-10 条你从其他渠道(行业群/邮件订阅/咨询机构)知道的、本应被 GRIS 发现的法规。一段时间后,这份清单的召回率就是你系统真实的覆盖度指标。",
+    "fields": {
+      "title": "法规正式名称(用于 hash 匹配 — 必须与 researcher 入库时的 title_original 接近)",
+      "title_aliases": "可选,标题的别名/简称/翻译,任一匹配即算召回",
+      "url": "可选,官方链接;命中则加分(URL 命中 ≈ 严格证据)",
+      "market": "适用市场",
+      "expected_impact": "你认为应该被打的影响等级:🔴/🟡/🟢",
+      "added_date": "添加日期(用于按时间窗筛选)",
+      "source": "你从哪里知道这条法规的(用来回顾盲区)"
+    }
+  },
+
+  "gold_entries": [
+    {
+      "title": "Regulation (EU) 2023/1542 on batteries and waste batteries",
+      "title_aliases": [
+        "EU Battery Regulation",
+        "电池法规 2023/1542",
+        "Battery Regulation"
+      ],
+      "url": "https://eur-lex.europa.eu/eli/reg/2023/1542/oj",
+      "market": "欧盟",
+      "expected_impact": "🔴",
+      "added_date": "2026-04-26",
+      "source": "示例条目 — 欧盟旗舰电池法规,任何 LEV 法规追踪系统都不应漏掉"
+    },
+    {
+      "title": "GB 17761-2018 电动自行车安全技术规范",
+      "title_aliases": [
+        "GB 17761",
+        "Electric bicycle safety technical specification"
+      ],
+      "url": "https://openstd.samr.gov.cn/bzgk/gb/newGbInfo?hcno=44E0C2FB31A3E55174C492F0A4D6D81F",
+      "market": "中国",
+      "expected_impact": "🔴",
+      "added_date": "2026-04-26",
+      "source": "示例条目 — 中国电动自行车强制标准"
+    },
+    {
+      "title": "EU Regulation 168/2013 type-approval of L-category vehicles",
+      "title_aliases": [
+        "Reg 168/2013",
+        "L1e L3e type approval"
+      ],
+      "url": "https://eur-lex.europa.eu/eli/reg/2013/168/oj",
+      "market": "欧盟",
+      "expected_impact": "🔴",
+      "added_date": "2026-04-26",
+      "source": "示例条目 — 欧盟 L 类车辆型式认证基础法规"
+    }
+  ]
+}

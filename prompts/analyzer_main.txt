@@ -1,0 +1,34 @@
+今日日期：{today}
+
+法规名称：{title}
+官方链接：{url}
+适用市场：{market}
+相关性说明：{relevance}
+
+以下是从官方网站抓取的原文内容：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{scraped_text}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+评分规则、affected_products / affected_markets / importance_note 的格式
+以及「不相关」边界，均见系统提示。
+
+输出严格 JSON（单个对象，不含 markdown）：
+{{
+  "requirement":     "中文 3–5 条要点（每条以数字编号，如：1. ... 2. ...）",
+  "dates": {{
+    "publish":            "YYYY-MM-DD 或 null",
+    "effective":          "YYYY-MM-DD 或 null",
+    "enforcements": [
+      {{"date": "YYYY-MM-DD", "scope": "适用条款/义务范围简述"}}
+    ],
+    "consultation_close": "YYYY-MM-DD 或 null"
+  }},
+  "deadline":        "最紧迫强制截止日 YYYY-MM-DD 或 null",
+  "importance":      "🔴 或 🟡 或 🟢（仅符号，三选一）",
+  "importance_note": "「阶段N + CX → 档位」开头，按系统提示格式",
+  "worst_case":      "不合规最坏后果（罚款金额/禁售/召回/吊销等）",
+  "business_impact": "对我司影响最大的 3 个要点（整车出口/供应链/终端销售/认证成本/产品设计变更等维度）",
+  "affected_products": "从以下选项选出（顿号分隔）：{product_list}；均不适用填不相关",
+  "affected_markets":  "受影响市场（按系统提示规范）"
+}}
