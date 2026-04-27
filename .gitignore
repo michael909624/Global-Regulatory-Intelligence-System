@@ -1,0 +1,24 @@
+# 敏感信息(绝对不能上传)
+config_local.py
+.env
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS 系统文件
+.DS_Store
+
+# 数据库 / 日志 / 报告(本地数据,不需要上传)
+data/*.db
+data/*.sqlite
+logs/
+reports/
+
+# Claude Code 本地配置
+.claude/
+
+# 编辑器
+.vscode/
+.idea/
