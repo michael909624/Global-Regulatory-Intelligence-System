@@ -37,6 +37,9 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
+      - name: 创建运行所需目录
+        run: mkdir -p data logs reports
+
       - name: 初始化数据库
         run: python gris.py init
         env:
