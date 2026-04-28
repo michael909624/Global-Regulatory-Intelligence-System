@@ -54,7 +54,8 @@ _MAX_CHARS     = 60_000   # 单条记录最长保留字符数
 _MAX_PDF_PAGES = 200      # 单 PDF 最长保留页数（超出走头尾分段策略）
 # 头/尾分段比例：6 : 4。法规典型结构=前 60% 是定义/适用范围，
 # 后 40% 是强制日 / 罚则 / 附录——两端都不能丢。
-_PDF_HEAD_RATIO = 0.6
+# 同时用于 PDF 页级截断 + 文本字符级截断。
+_HEAD_RATIO    = 0.6
 _PDF_PAGE_LIMIT_REACHED = "PDF_PAGE_LIMIT"
 
 _NOISE_TAGS = ["script", "style", "nav", "header", "footer",
@@ -213,7 +214,7 @@ def _extract_pdf(content: bytes) -> tuple[str | None, bool]:
                 text = "\n".join(pages).strip()
                 return (text or None, False)
 
-            head_n = int(_MAX_PDF_PAGES * _PDF_HEAD_RATIO)
+            head_n = int(_MAX_PDF_PAGES * _HEAD_RATIO)
             tail_n = _MAX_PDF_PAGES - head_n
             head_pages = [p.extract_text() or "" for p in pdf.pages[:head_n]]
             tail_pages = [p.extract_text() or "" for p in pdf.pages[-tail_n:]]
@@ -294,7 +295,19 @@ def scrape_url(url: str) -> tuple[str | None, str, bool]:
             ctype = "webpage"
 
         if text and len(text) > _MAX_CHARS:
-            return text[:_MAX_CHARS], ctype, True
+            # 头尾智能截断：保留头部适用范围 + 尾部强制日/罚则/附录。
+            # 早期粗暴 text[:_MAX_CHARS] 会丢掉法规尾部的关键合规信息，
+            # 让下游 analyzer 的 truncate_smart 拿到的也只是头部，无从恢复。
+            head_n  = int(_MAX_CHARS * _HEAD_RATIO)
+            tail_n  = _MAX_CHARS - head_n
+            omitted = len(text) - _MAX_CHARS
+            text = (
+                text[:head_n].rstrip()
+                + f"\n\n[...中部 {omitted:,} 字符已省略，"
+                  f"保留前 {head_n:,} 字适用范围 + 后 {tail_n:,} 字强制日/罚则/附录...]\n\n"
+                + text[-tail_n:].lstrip()
+            )
+            return text, ctype, True
         return text, ctype, page_truncated
 
     except requests.RequestException as e:
