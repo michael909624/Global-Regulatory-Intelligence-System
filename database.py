@@ -15,9 +15,9 @@ from contextlib import contextmanager
 from datetime import datetime
 
 from config import DATABASE_PATH
-from utils import reg_hash, get_logger
+from utils import get_logger
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 9
 _log = get_logger("database")
 
 
@@ -68,13 +68,13 @@ _DDL_LATEST = """
         priority         TEXT,
         product_category TEXT,
         market           TEXT,
-        publish_date     TEXT,
-        effective_date   TEXT,
         raw_text         TEXT,
         content_hash     TEXT UNIQUE,
         scrape_status    TEXT NOT NULL DEFAULT '待抓取'
                          CHECK(scrape_status IN ('待抓取','已抓取','失败','需人工')),
-        fallback_urls    TEXT
+        fallback_urls    TEXT,
+        reg_id           TEXT,
+        consolidated_into INTEGER REFERENCES raw_search_results(id)
     );
 
     CREATE TABLE IF NOT EXISTS scraped_content (
@@ -103,6 +103,7 @@ _DDL_LATEST = """
         market_tier                 INTEGER,
         worst_case_scenario         TEXT,
         business_impact             TEXT,
+        business_dimensions         TEXT,
         sources                     TEXT,
         content_hash                TEXT,
         source_institution          TEXT,
@@ -153,6 +154,14 @@ def _bootstrap_or_migrate(conn: sqlite3.Connection) -> None:
         _migrate_to_v4(conn)
     if cur_v < 5:
         _migrate_to_v5(conn)
+    if cur_v < 6:
+        _migrate_to_v6(conn)
+    if cur_v < 7:
+        _migrate_to_v7(conn)
+    if cur_v < 8:
+        _migrate_to_v8(conn)
+    if cur_v < 9:
+        _migrate_to_v9(conn)
 
     conn.execute("DELETE FROM schema_version")
     conn.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
@@ -194,6 +203,54 @@ def _migrate_to_v5(conn: sqlite3.Connection) -> None:
     """v4→v5：raw_search_results 添加 fallback_urls 字段（JSON 数组，scraper 主 URL 失败时按序回退）。"""
     if not _column_exists(conn, "raw_search_results", "fallback_urls"):
         conn.execute("ALTER TABLE raw_search_results ADD COLUMN fallback_urls TEXT")
+
+
+def _migrate_to_v6(conn: sqlite3.Connection) -> None:
+    """v5→v6：raw_search_results 添加 reg_id 字段（模型自报的法规规范编号，用于 Stage 0 跨条目聚类）。"""
+    if not _column_exists(conn, "raw_search_results", "reg_id"):
+        conn.execute("ALTER TABLE raw_search_results ADD COLUMN reg_id TEXT")
+
+
+def _migrate_to_v7(conn: sqlite3.Connection) -> None:
+    """v6→v7：raw_search_results 添加 consolidated_into（Stage 0 软合并指针）。
+
+    被合并的条目设 consolidated_into=主条目id，scrape_status 改为 '已抓取'，
+    scraper 与 analyzer 都跳过；保留行便于复盘"模型在哪些 reg_id 上重复"。
+    """
+    if not _column_exists(conn, "raw_search_results", "consolidated_into"):
+        conn.execute(
+            "ALTER TABLE raw_search_results "
+            "ADD COLUMN consolidated_into INTEGER REFERENCES raw_search_results(id)"
+        )
+
+
+def _migrate_to_v8(conn: sqlite3.Connection) -> None:
+    """v7→v8：compliance_analysis 添加 business_dimensions（八维 L3 业务影响坐标）。
+
+    JSON 数组，元素来自 enum：RD / PROD / CERT / IMPORT / RETAIL / USE / ENFORCE / EOL。
+    任一维度触发即"相关"；空数组表示真"不相关"。
+    用途：搜索切片（researcher 按 8 维 L3 枚举议题）+ 收敛分组（Stage 3 Pass 2）。
+    报告端有意保持精简，不展示该字段——维度信号通过 business_impact 文本间接传达。
+    """
+    if not _column_exists(conn, "compliance_analysis", "business_dimensions"):
+        conn.execute(
+            "ALTER TABLE compliance_analysis ADD COLUMN business_dimensions TEXT"
+        )
+
+
+def _migrate_to_v9(conn: sqlite3.Connection) -> None:
+    """v8→v9：清理 raw_search_results 的死列。
+
+    publish_date / effective_date 自始至终没有写入路径——researcher、scraper、analyzer
+    全都不写。日期信息由 analyzer 写入 compliance_analysis.key_dates JSON。
+    SQLite 3.35+ 支持 ALTER TABLE DROP COLUMN，本项目部署机器为 3.50。
+    """
+    for col in ("publish_date", "effective_date"):
+        if _column_exists(conn, "raw_search_results", col):
+            try:
+                conn.execute(f"ALTER TABLE raw_search_results DROP COLUMN {col}")
+            except sqlite3.OperationalError as e:
+                _log.warning("DROP COLUMN raw_search_results.%s skipped: %s", col, e)
 
 
 def _migrate_importance_emoji(conn: sqlite3.Connection) -> None:
@@ -297,31 +354,6 @@ def _migrate_product_names(conn: sqlite3.Connection) -> None:
 # ── raw_search_results ────────────────────────────────────────────────────────
 
 
-def insert_raw_result(data: dict) -> int | None:
-    """插入一条搜索结果；同 content_hash 静默跳过。"""
-    sql = """
-        INSERT OR IGNORE INTO raw_search_results
-            (query_date, source_url, title, title_cn, snippet, priority,
-             product_category, market, publish_date, effective_date,
-             raw_text, content_hash, scrape_status)
-        VALUES
-            (:query_date, :source_url, :title, :title_cn, :snippet, :priority,
-             :product_category, :market, :publish_date, :effective_date,
-             :raw_text, :content_hash, :scrape_status)
-    """
-    data.setdefault("content_hash", reg_hash(data.get("title", "")))
-    data.setdefault("scrape_status", "待抓取")
-    data.setdefault("query_date", datetime.now().isoformat())
-    for field in (
-        "source_url", "title", "title_cn", "snippet", "priority",
-        "product_category", "market", "publish_date", "effective_date", "raw_text",
-    ):
-        data.setdefault(field, None)
-    with get_connection() as conn:
-        cur = conn.execute(sql, data)
-        return cur.lastrowid if cur.rowcount else None
-
-
 def get_raw_result(raw_id: int) -> sqlite3.Row | None:
     with get_connection() as conn:
         return conn.execute(
@@ -330,9 +362,11 @@ def get_raw_result(raw_id: int) -> sqlite3.Row | None:
 
 
 def get_pending_scrape() -> list[sqlite3.Row]:
+    """待抓取条目；自动跳过 Stage 0 软合并的从条目（consolidated_into 非空）。"""
     with get_connection() as conn:
         return conn.execute(
-            "SELECT * FROM raw_search_results WHERE scrape_status = '待抓取'"
+            "SELECT * FROM raw_search_results "
+            "WHERE scrape_status = '待抓取' AND consolidated_into IS NULL"
         ).fetchall()
 
 
@@ -391,10 +425,10 @@ _REPORT_SELECT = """
         ca.compliance_requirement,
         COALESCE(ca.affected_products_display, ca.affected_products) AS affected_products_display,
         ca.affected_markets,
-        rs.publish_date,
         ca.compliance_deadline,
         ca.key_dates,
         rs.source_url,
+        rs.fallback_urls,
         rs.market,
         ca.worst_case_scenario,
         ca.business_impact,
@@ -408,12 +442,14 @@ _REPORT_SELECT = """
     WHERE COALESCE(ca.affected_products_display, ca.affected_products) != '不相关'
       AND COALESCE(ca.affected_products_display, ca.affected_products) IS NOT NULL
       AND COALESCE(ca.affected_products_display, ca.affected_products) != ''
+      AND rs.consolidated_into IS NULL
 """
 
 _REPORT_ORDER = """
     ORDER BY
         CASE ca.impact_level WHEN '🔴' THEN 1 WHEN '🟡' THEN 2 WHEN '🟢' THEN 3 ELSE 9 END,
         COALESCE(ca.market_tier, 99),
+        COALESCE(ca.affected_markets, ''),
         CASE
             WHEN COALESCE(ca.affected_products_display, ca.affected_products) LIKE '%短交通%' THEN 1
             WHEN COALESCE(ca.affected_products_display, ca.affected_products) LIKE '%ebike%'
@@ -452,8 +488,17 @@ def get_manual_followup() -> list[sqlite3.Row]:
 
 
 def delete_orphan_scraped() -> int:
-    """删除没有任何 compliance_analysis 引用的 scraped_content。"""
+    """删除没有任何 compliance_analysis 引用的 scraped_content。
+
+    安全护栏：当 compliance_analysis 完全为空时直接返回 0，避免
+    `NOT IN ()` 在 SQL 中等价于 TRUE 而把整张表清空。
+    """
     with get_connection() as conn:
+        n_analyses = conn.execute(
+            "SELECT COUNT(*) FROM compliance_analysis"
+        ).fetchone()[0]
+        if not n_analyses:
+            return 0
         cur = conn.execute("""
             DELETE FROM scraped_content
             WHERE id NOT IN (SELECT DISTINCT scraped_id FROM compliance_analysis)

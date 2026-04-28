@@ -17,12 +17,13 @@ HELP = """
 
 ━━━  主流水线  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  run               完整流水线：发现 → 抓取 → 分析 → 报告（4步）
+  run               完整流水线：发现 → 聚类 → 抓取 → 分析 → 报告（5步）
   run --quick       快速模式：仅搜索近 90 天新发布
 
-  research          Gemini 发现层：搜索并入库待抓取 URL（D1–D4 共 4 次调用）
+  research          Gemini 发现层：议题图召回（plan/fetch/audit 三阶段）
   research --quick  快速模式（仅新发布窗口）
 
+  consolidate       Stage 0 法规编号聚类：同 reg_id 软合并到主条目
   scrape            抓取待处理 URL 的网页/PDF 原文
   analyze           对已抓取内容进行 AI 合规分析（基于真实原文）
   report            生成 Excel 周报（保存至 reports/ 目录）
@@ -75,8 +76,11 @@ HELP = """
 
 def cmd_research(args: list[str]):
     import researcher
+    import ai_client
     quick = "--quick" in args
+    ai_client.reset_token_stats()
     researcher.run_research(quick=quick)
+    ai_client.print_token_summary()
 
 
 def cmd_backfill(args: list[str]):
@@ -143,13 +147,16 @@ def cmd_backfill(args: list[str]):
 
 def cmd_run(args: list[str]):
     import time
+    import ai_client
     from database import get_connection
     import researcher
+    import consolidator
     import scraper
     import analyzer
     import reporter
 
     quick = "--quick" in args
+    ai_client.reset_token_stats()
 
     def _elapsed(t0: float) -> str:
         s = time.time() - t0
@@ -162,7 +169,7 @@ def cmd_run(args: list[str]):
 
     mode_label = "快速（仅新发布）" if quick else "全量（新发布 + 即将生效）"
 
-    print(f"\n[1/4] Gemini 发现层（{mode_label}）...")
+    print(f"\n[1/5] Gemini 发现层（{mode_label}）...")
     t0 = time.time()
     try:
         inserted, skipped = researcher.run_research(quick=quick)
@@ -172,7 +179,17 @@ def cmd_run(args: list[str]):
         print(f"      ❌ 错误 ({_elapsed(t0)})：{e}")
         results["发现"] = (False, str(e))
 
-    print("\n[2/4] 抓取法规原文...")
+    print("\n[2/5] 法规编号聚类（Stage 0）...")
+    t0 = time.time()
+    try:
+        groups, merged, untouched = consolidator.consolidate_pending(verbose=True)
+        print(f"      完成 ({_elapsed(t0)})  合并 {groups} 组 / {merged} 条")
+        results["聚类"] = (True, f"{groups} 组 / 减 {merged} 条")
+    except Exception as e:
+        print(f"      ❌ 错误 ({_elapsed(t0)})：{e}")
+        results["聚类"] = (False, str(e))
+
+    print("\n[3/5] 抓取法规原文...")
     t0 = time.time()
     try:
         ok, fail, manual = scraper.scrape_all()
@@ -182,7 +199,7 @@ def cmd_run(args: list[str]):
         print(f"      ❌ 错误 ({_elapsed(t0)})：{e}")
         results["抓取"] = (False, str(e))
 
-    print("\n[3/4] 合规分析（基于抓取原文）...")
+    print("\n[4/5] 合规分析（基于抓取原文）...")
     t0 = time.time()
     try:
         n_analyzed, n_dup, n_fail = analyzer.run_analysis()
@@ -192,7 +209,7 @@ def cmd_run(args: list[str]):
         print(f"      ❌ 错误 ({_elapsed(t0)})：{e}")
         results["分析"] = (False, str(e))
 
-    print("\n[4/4] 生成周报...")
+    print("\n[5/5] 生成周报...")
     t0 = time.time()
     report_path = None
     try:
@@ -216,16 +233,28 @@ def cmd_run(args: list[str]):
     if report_path:
         print(f"\n  报告已保存：{report_path}")
     print("=" * 44)
+    ai_client.print_token_summary("  ")
 
 
-def cmd_scrape(_args: list[str]):
+def cmd_consolidate(_args: list[str]):
+    """Stage 0：法规编号聚类（在 scrape 之前对 reg_id 相同的条目软合并）。"""
+    from consolidator import run_consolidation_command
+    run_consolidation_command()
+
+
+def cmd_scrape(args: list[str]):
     import scraper
-    scraper.scrape_all()
+    force = "--force-refresh" in args
+    scraper.scrape_all(force_refresh=force)
 
 
-def cmd_analyze(_args: list[str]):
+def cmd_analyze(args: list[str]):
     import analyzer
-    analyzer.run_analysis()
+    import ai_client
+    skip_fallback = "--skip-fallback" in args
+    ai_client.reset_token_stats()
+    analyzer.run_analysis(skip_fallback=skip_fallback)
+    ai_client.print_token_summary()
 
 
 def cmd_report(_args: list[str]):
@@ -308,7 +337,7 @@ def cmd_view(args: list[str]):
 
 
 def cmd_retry(_args: list[str]):
-    from database import get_connection, init_db
+    from database import get_connection, init_db, delete_orphan_scraped
 
     init_db()
     with get_connection() as conn:
@@ -318,11 +347,32 @@ def cmd_retry(_args: list[str]):
         if count == 0:
             print("没有失败或需人工的记录，无需重试。")
             return
+
+        # 同步清理这些 raw 关联的 ⚠️ 合成分析——避免重抓真原文后被 30 天 hash 拦截，
+        # 让用户看到的周报始终是最新原文版本而不是旧合成版本。
+        synth_deleted = conn.execute("""
+            DELETE FROM compliance_analysis
+            WHERE id IN (
+                SELECT ca.id FROM compliance_analysis ca
+                JOIN scraped_content sc ON sc.id = ca.scraped_id
+                JOIN raw_search_results rs ON rs.id = sc.raw_id
+                WHERE rs.scrape_status IN ('失败','需人工')
+                  AND sc.full_text LIKE '[Gemini synthesis]%'
+            )
+        """).rowcount or 0
+
         conn.execute(
             "UPDATE raw_search_results SET scrape_status='待抓取' "
             "WHERE scrape_status IN ('失败','需人工')"
         )
+
+    orphan_deleted = delete_orphan_scraped()
+
     print(f"已将 {count} 条记录重置为待抓取。运行 [scrape] 重新尝试。")
+    if synth_deleted:
+        print(f"  └ 顺手清理 {synth_deleted} 条 ⚠️ 合成分析（让真原文有机会替换）")
+    if orphan_deleted:
+        print(f"  └ 回收 {orphan_deleted} 条孤儿 scraped_content")
 
 
 def cmd_clean(_args: list[str]):
@@ -373,7 +423,8 @@ def cmd_status(_args: list[str]):
 
     with get_connection() as conn:
         total_raw   = conn.execute("SELECT COUNT(*) FROM raw_search_results").fetchone()[0]
-        scraped     = conn.execute("SELECT COUNT(*) FROM raw_search_results WHERE scrape_status='已抓取'").fetchone()[0]
+        seeds       = conn.execute("SELECT COUNT(*) FROM raw_search_results WHERE priority='种子'").fetchone()[0]
+        scraped     = conn.execute("SELECT COUNT(*) FROM raw_search_results WHERE scrape_status='已抓取' AND priority!='种子'").fetchone()[0]
         pending     = conn.execute("SELECT COUNT(*) FROM raw_search_results WHERE scrape_status='待抓取'").fetchone()[0]
         failed      = conn.execute("SELECT COUNT(*) FROM raw_search_results WHERE scrape_status='失败'").fetchone()[0]
         manual      = conn.execute("SELECT COUNT(*) FROM raw_search_results WHERE scrape_status='需人工'").fetchone()[0]
@@ -385,6 +436,7 @@ def cmd_status(_args: list[str]):
     print()
     print("━━━  数据库概览  ━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print(f"  原始搜索结果    {total_raw:>5} 条")
+    print(f"    ├ 种子(占位)   {seeds:>5} 条  （不参与抓取/分析）")
     print(f"    ├ 已抓取       {scraped:>5} 条")
     print(f"    ├ 待抓取       {pending:>5} 条")
     print(f"    ├ 抓取失败     {failed:>5} 条")
@@ -456,9 +508,10 @@ def cmd_evaluate(_args: list[str]):
 
 # (command | None=separator, display description)
 _MENU: list[tuple[str, str] | None] = [
-    ("run",      "完整流水线：Gemini情报研究 → 生成报告  附加：--quick（仅新发布）"),
-    ("research", "Gemini 情报研究（搜索+合成）  附加：--quick"),
-    ("scrape",   "抓取所有待处理 URL 的网页正文"),
+    ("run",         "完整流水线：Gemini情报研究 → 生成报告  附加：--quick（仅新发布）"),
+    ("research",    "Gemini 情报研究（搜索+合成）  附加：--quick"),
+    ("consolidate", "法规编号聚类（Stage 0）：同 reg_id 软合并到主条目"),
+    ("scrape",      "抓取所有待处理 URL 的网页正文"),
     ("analyze",  "对已抓取内容进行 AI 合规分析"),
     ("report",   "生成 Excel 周报（保存至 reports/）"),
     None,
@@ -543,23 +596,24 @@ def cmd_menu(_args: list[str]):
 # ── 路由 ──────────────────────────────────────────────────────────────────────
 
 COMMANDS = {
-    "run":       cmd_run,
-    "research":  cmd_research,
-    "backfill":  cmd_backfill,
-    "scrape":    cmd_scrape,
-    "analyze":   cmd_analyze,
-    "report":    cmd_report,
-    "view":      cmd_view,
-    "status":    cmd_status,
-    "manual":    cmd_manual,
-    "retry":     cmd_retry,
-    "clean":     cmd_clean,
-    "reanalyze": cmd_reanalyze,
-    "reset":     cmd_reset,
-    "init":      cmd_init,
-    "seed":      cmd_seed,
-    "evaluate":  cmd_evaluate,
-    "menu":      cmd_menu,
+    "run":         cmd_run,
+    "research":    cmd_research,
+    "backfill":    cmd_backfill,
+    "consolidate": cmd_consolidate,
+    "scrape":      cmd_scrape,
+    "analyze":     cmd_analyze,
+    "report":      cmd_report,
+    "view":        cmd_view,
+    "status":      cmd_status,
+    "manual":      cmd_manual,
+    "retry":       cmd_retry,
+    "clean":       cmd_clean,
+    "reanalyze":   cmd_reanalyze,
+    "reset":       cmd_reset,
+    "init":        cmd_init,
+    "seed":        cmd_seed,
+    "evaluate":    cmd_evaluate,
+    "menu":        cmd_menu,
 }
 
 

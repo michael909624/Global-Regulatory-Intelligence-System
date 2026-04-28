@@ -1,23 +1,27 @@
 """
 Seeds — 高权威源种子库。
 
-作用:不依赖 AI 发现,直接把已知权威源的"待审查链接"塞进抓取队列。
+作用:登记一批已知的权威监管入口/索引页,作为系统认知边界的标记。
 对应公司业务:轻型电动出行(LEV)整机 + 锂电池 + 电机 + 充电器 + BMS。
 
 设计原则:
-  • 每条种子是一个 *入口页* 或 *搜索结果页*,scraper 抓回来后,
-    analyzer 会基于其文本判断是否相关、做合规分析。
-  • 种子的目的是"保底召回",防止 AI 偶尔漏掉头部权威源。
-  • AI 发现层(researcher)与种子互补,不冲突 — 都入同一队列,
-    后续按 reg_hash(title) 去重。
+  • 种子是 *入口页 / 搜索结果页*,本身不是某条具体法规
+    (例:federalregister 搜索 URL、CPSC Recalls 列表、SAMR 法规库索引)
+  • 种子 *不参与* scrape → analyze 流水线 — 入库时 priority='种子'、
+    scrape_status='已抓取',scraper 与 analyzer 都会跳过它们,不会出现在
+    Excel 周报里(否则索引页会被分析成"信息不足 → 🟢"污染报告)。
+  • 种子的真正用途:
+      1. 占位去重 — researcher 之后若发现同 title hash 直接跳过,避免
+         AI 又把这些入口页当作"新发现"重复入库
+      2. 黄金集评估 — evaluate.py 的 reg_hash 匹配会命中这些条目
 
 如何维护:
   • 每月抽 5 分钟,审查 SEEDS 里的链接是否仍可用。
   • 发现新的权威源,加到对应分组。
 
 如何使用:
-  • python gris.py seed             # 只注入种子(不调用 AI)
-  • python gris.py run              # 自动包含种子注入 + AI 发现
+  • python gris.py seed   # 注入/刷新种子(幂等,可反复调用)
+  • python gris.py run    # 自动包含种子注入 + AI 发现
 """
 from __future__ import annotations
 
@@ -149,15 +153,37 @@ SEEDS: list[dict] = [
 
 # ── 注入 ──────────────────────────────────────────────────────────────────────
 
+def _purge_legacy_seed_artifacts(conn, raw_id: int) -> int:
+    """清理旧版本遗留:同一种子 raw_id 关联的 scraped_content + compliance_analysis。
+
+    早期种子会进入 scrape→analyze 管线,产生"信息不足→🟢"的无意义分析。
+    新版本种子不再走分析,需要把历史污染数据回收掉。
+    返回删除的 scraped_content 行数。
+    """
+    sc_rows = conn.execute(
+        "SELECT id FROM scraped_content WHERE raw_id = ?", (raw_id,)
+    ).fetchall()
+    if not sc_rows:
+        return 0
+    sc_ids = [r["id"] for r in sc_rows]
+    ph = ",".join("?" * len(sc_ids))
+    conn.execute(f"DELETE FROM compliance_analysis WHERE scraped_id IN ({ph})", sc_ids)
+    conn.execute(f"DELETE FROM scraped_content     WHERE id         IN ({ph})", sc_ids)
+    return len(sc_ids)
+
+
 def inject_seeds() -> tuple[int, int]:
     """
-    把所有 SEEDS 入库到 raw_search_results,scrape_status='待抓取'。
+    把所有 SEEDS 登记到 raw_search_results,priority='种子'、scrape_status='已抓取'。
+    种子不参与 scrape/analyze 流水线 — 仅作为占位去重 + 黄金集评估的标记。
 
-    去重:基于 reg_hash(title);已存在则跳过。
-    返回 (inserted, skipped)。
+    幂等:重复调用会刷新已存在种子的 priority/status,并清掉早期版本遗留的
+    scraped_content / compliance_analysis 污染数据。
+
+    返回 (inserted, refreshed)。
     """
     init_db()
-    inserted = skipped = 0
+    inserted = refreshed = purged_artifacts = 0
 
     with get_connection() as conn:
         for s in SEEDS:
@@ -167,47 +193,50 @@ def inject_seeds() -> tuple[int, int]:
             note   = s.get("note", "").strip()
             h      = reg_hash(title)
 
-            # 如果近期已入库过同 hash,跳过
-            if conn.execute(
-                "SELECT 1 FROM raw_search_results WHERE content_hash=?",
+            existing = conn.execute(
+                "SELECT id, priority, scrape_status FROM raw_search_results "
+                "WHERE content_hash=?",
                 (h,),
-            ).fetchone():
-                skipped += 1
-                continue
-            if conn.execute(
-                "SELECT 1 FROM compliance_analysis WHERE content_hash=?",
-                (h,),
-            ).fetchone():
-                skipped += 1
+            ).fetchone()
+
+            if existing:
+                purged_artifacts += _purge_legacy_seed_artifacts(conn, existing["id"])
+                if existing["priority"] != "种子" or existing["scrape_status"] != "已抓取":
+                    conn.execute(
+                        "UPDATE raw_search_results "
+                        "SET priority='种子', scrape_status='已抓取' "
+                        "WHERE id=?",
+                        (existing["id"],),
+                    )
+                    refreshed += 1
                 continue
 
             conn.execute("""
-                INSERT OR IGNORE INTO raw_search_results
+                INSERT INTO raw_search_results
                     (query_date, source_url, title, title_cn, snippet, priority,
                      product_category, market, content_hash, scrape_status,
                      fallback_urls)
-                VALUES (?,?,?,?,?,'高',null,?,?,'待抓取',?)
+                VALUES (?,?,?,?,?,'种子',null,?,?,'已抓取',?)
             """, (
                 datetime.now().isoformat(),
                 url, title, title[:25], note[:500], market,
                 h, None,
             ))
-            if conn.execute("SELECT changes()").fetchone()[0]:
-                inserted += 1
-            else:
-                skipped += 1
+            inserted += 1
 
-    _log.info("Seeds injected: new=%d skipped=%d total=%d",
-              inserted, skipped, len(SEEDS))
-    return inserted, skipped
+    _log.info(
+        "Seeds injected: new=%d refreshed=%d purged_artifacts=%d total=%d",
+        inserted, refreshed, purged_artifacts, len(SEEDS),
+    )
+    return inserted, refreshed
 
 
 def run_seed_command() -> None:
     """CLI 入口:python gris.py seed"""
-    print(f"\n  种子库共 {len(SEEDS)} 条权威源,正在注入待抓取队列...")
-    new, skip = inject_seeds()
-    print(f"\n  完成:新增 {new} 条,已存在跳过 {skip} 条。")
-    print(f"  下一步:运行 python gris.py scrape 抓取这些种子。\n")
+    print(f"\n  种子库共 {len(SEEDS)} 条权威源,正在登记...")
+    new, refreshed = inject_seeds()
+    print(f"\n  完成:新增 {new} 条,刷新 {refreshed} 条历史种子。")
+    print(f"  种子不参与抓取/分析 — 仅作为占位去重与黄金集评估的标记。\n")
 
 
 if __name__ == "__main__":

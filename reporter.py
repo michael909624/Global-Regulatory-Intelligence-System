@@ -14,6 +14,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+import authority
 from config import REPORTS_DIR
 from database import init_db, get_all_analyses, get_week_analyses, get_manual_followup
 
@@ -41,6 +42,9 @@ def _clean(v):
 
 _MAIN_COL_CAPS   = [5, 16, 32, 42, 52, 52, 34, 52]
 _MANUAL_COL_CAPS = [50, 70, 12]
+
+# 从 business_impact 字段过滤掉 analyzer 历史追加的"（重要度标注：…）"后缀
+_IMPORTANCE_NOTE_PAT = re.compile(r"[\n\s]*（重要度标注：[^）]*）", re.MULTILINE)
 
 
 def _cjk_len(s: str) -> float:
@@ -96,7 +100,7 @@ def _fit_sheet(ws, col_caps=None) -> None:
 
 # ── 数据格式化 ────────────────────────────────────────────────────────────────
 
-def _fmt_dates(pub: str | None, deadline: str | None, key_dates_json: str | None) -> str:
+def _fmt_dates(deadline: str | None, key_dates_json: str | None) -> str:
     kd: dict = {}
     if key_dates_json:
         try:
@@ -124,18 +128,12 @@ def _fmt_dates(pub: str | None, deadline: str | None, key_dates_json: str | None
             parts.append(f"强制日：{d}（{scope}）" if scope else f"强制日：{d}")
             seen.add(d)
 
-    te = kd.get("transition_end")
-    if te and te not in seen:
-        parts.append(f"强制日：{te}")
-        seen.add(te)
-
     if kd.get("consultation_close") and kd["consultation_close"] not in seen:
         parts.append(f"咨询截止：{kd['consultation_close']}")
 
-    # 极旧记录 fallback
-    if not parts:
-        if pub:      parts.append(f"发布日：{pub[:10]}")
-        if deadline: parts.append(f"截止日：{deadline}")
+    # 极旧记录 fallback：key_dates 全空时仅显示 deadline
+    if not parts and deadline:
+        parts.append(f"截止日：{deadline}")
 
     return "\n".join(parts) or "待确认"
 
@@ -251,12 +249,12 @@ def _fill_sheet(ws, rows) -> None:
         requirement        = row["compliance_requirement"] or ""
         products_display   = row["affected_products_display"] or ""
         markets            = row["affected_markets"] or ""
-        pub_date           = row["publish_date"]
         deadline           = row["compliance_deadline"]
         key_dates          = row["key_dates"]
         src_url            = row["source_url"] or ""
+        fallback_urls_json = row["fallback_urls"] or ""
         worst_case         = row["worst_case_scenario"] or ""
-        business_impact    = row["business_impact"] or ""
+        business_impact    = _IMPORTANCE_NOTE_PAT.sub("", row["business_impact"] or "").strip()
         sources_json       = row["sources"] or ""
         source_institution = row["source_institution"]
         source_language    = row["source_language"]
@@ -271,13 +269,29 @@ def _fill_sheet(ws, rows) -> None:
         display_title    = (title_cn or title_orig).strip()
         display_products = products_display.replace("、", "\n")
 
+        # Stage 4：从所有候选 URL（主 / fallback / sources）选权威分最高的作 hyperlink。
+        # 兼顾旧数据（未经 Stage 0 权威排序）和模型自报多源的新数据。
+        candidates: list[str] = [src_url] if src_url else []
+        if fallback_urls_json:
+            try:
+                fb = json.loads(fallback_urls_json)
+                if isinstance(fb, list):
+                    candidates.extend(u for u in fb if isinstance(u, str))
+            except Exception:
+                pass
         if sources_json:
             try:
                 srcs = json.loads(sources_json)
-                if srcs and isinstance(srcs, list) and srcs[0].get("url"):
-                    src_url = srcs[0]["url"]
+                if isinstance(srcs, list):
+                    for s in srcs:
+                        if isinstance(s, dict) and s.get("url"):
+                            candidates.append(s["url"])
             except Exception:
                 pass
+        if candidates:
+            src_url = authority.best_url(candidates) or src_url
+
+        biz_block = (business_impact or worst_case).strip()
 
         ws.append([_clean(v) for v in [
             _BADGE_TEXT.get(impact, impact),
@@ -285,8 +299,8 @@ def _fill_sheet(ws, rows) -> None:
             markets,
             display_title,
             requirement,
-            (business_impact or worst_case).strip(),
-            _fmt_dates(pub_date, deadline, key_dates),
+            biz_block,
+            _fmt_dates(deadline, key_dates),
             _fmt_source(source_institution, source_language, title_orig, src_url),
         ]])
         _style_row(ws, ws.max_row, impact, parity, first_in_group=is_new)
@@ -358,9 +372,12 @@ def generate_report() -> str:
     _fill_sheet(ws1, all_rows)
     _fit_sheet(ws1, _MAIN_COL_CAPS)
 
-    ws2 = wb.create_sheet("本周新增")
+    ws2 = wb.create_sheet("本次新增")
     _fill_sheet(ws2, week_rows)
     _fit_sheet(ws2, _MAIN_COL_CAPS)
+
+    # business_dimensions 仅用于搜索切片 + Stage 3 收敛；
+    # 报告端有意保持精简，维度信号通过 business_impact 文本里的"按维度展开"间接传达。
 
     _sheet_manual(wb)
 
@@ -371,7 +388,7 @@ def generate_report() -> str:
 
     print(f"报告已生成：{filepath}")
     print(f"  合规情报总览：{len(all_rows)} 条")
-    print(f"  本周新增    ：{len(week_rows)} 条")
+    print(f"  本次新增    ：{len(week_rows)} 条")
     return filepath
 
 

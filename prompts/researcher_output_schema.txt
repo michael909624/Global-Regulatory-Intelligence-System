@@ -3,10 +3,20 @@
 
 [
   {
-    "title_original": "法规/标准的正式官方名称（原始语言，如 Regulation (EU) 2023/1542）",
-    "title_cn":       "≤20 字中文简标题（用于报表显示）",
-    "url":            "官方原文最权威链接（官方公报/政府/标准机构）；无法确认则 null",
-    "market_hint":    "主要适用市场（多个用顿号分隔）",
-    "relevance_note": "一句话说明与我司产品的关联"
+    "title_original":      "法规/标准的正式官方名称（原始语言，如 Regulation (EU) 2023/1542）",
+    "title_cn":            "≤20 字中文简标题（用于报表显示）",
+    "reg_id":              "法规规范编号——下游用它做跨条目聚类，请尽可能填，能填得越规范越好。
+                            优先级：CELEX (32024R2847) > (EU) YYYY/NNNN > GB / CFR / UN R / EN / IEC / UL 等编号 >
+                                   知名别名 (CRA, AI Act, Battery Regulation, PSTI, REACH SVHC)。
+                            规则：① 不存在正式编号则填 null；
+                                 ② 严禁编造或使用 XXX / TBD / placeholder 等占位文本；
+                                 ③ 同一法规在你的整个输出里只用同一种 reg_id 写法",
+    "url":                 "官方原文最权威链接（官方公报/政府/标准机构）；无法确认则 null",
+    "market_hint":         "主要适用市场（多个用顿号分隔）",
+    "business_dimensions": "数组，从八维 L3 中选 1-3 个：
+                            售前 RD / PROD / CERT，售中 IMPORT / RETAIL / USE，售后 ENFORCE / EOL；
+                            基于议题归属与法规标题做轻量预判即可（不需读完原文）；
+                            真不确定填空数组 []，由下游 analyzer 基于原文最终确认",
+    "relevance_note":      "一句话说明与我司产品的关联（点出主要业务影响维度）"
   }
 ]

@@ -1,13 +1,16 @@
 """
-Researcher：Gemini Flash + Google Search grounding 发现层。
+Researcher：议题驱动的三阶段召回。
 
-只做发现，不做合规解读。每条入库到 raw_search_results（scrape_status='待抓取'），
-后续由 scraper 抓正文，再由 analyzer 做结构化合规分析。
+设计范式：从"自由发现 N 条"转向"系统性扫描已枚举的搜索空间"。
 
-调用结构：4 个全球调用（D1–D4 各一次）。
-非英语市场（日 / 韩 / 俄）不再单独跑——在每次维度搜索内显式要求模型用各国
-本地语言（日本語 / 한국어 / русский 等）查询当地官方机构与法规框架，
-由模型按语言特点自行适配。
+三阶段：
+  1. Plan   — 让模型枚举每个维度下的监管议题图（监管面清单，不是具体法规）
+  2. Fetch  — 对每个议题独立发起搜索，双温度（t=0.2 + t=1.0）合并去重
+              低温捞确凿头部（CRA 类必出），高温捞长尾（小众法域）
+  3. Audit  — 对零命中议题用更宽时间窗 + 高温重试，闭环修复漏检
+
+议题图本身不持久化——每次 run 重新枚举（占总耗时 <5%，刷新成本低）。
+召回的去重契约（reg_hash + 30 天窗口）保持不变，承接现有 scraper / analyzer。
 """
 from __future__ import annotations
 
@@ -23,51 +26,115 @@ from utils import get_logger, parse_json_array, reg_hash
 
 _log = get_logger("researcher")
 
+# 公共五维业务影响坐标——注入到 plan / fetch system prompt，
+# 与 analyzer / consolidation 共享同一套判定语言（端到端闭环）。
+_BUSINESS_SCOPE = prompts.load("business_scope")
+
 # ── 搜索时间窗 ────────────────────────────────────────────────────────────────
 NEW_PUBLICATION_DAYS   = 90    # Track A：近 90 天新发布
 UPCOMING_DEADLINE_DAYS = 365   # Track B：未来 365 天即将生效
 
-# ── 合规维度 ──────────────────────────────────────────────────────────────────
-DIMENSIONS: dict[int, dict] = {
-    1: {
-        "name": "D1 产品准入（B 端义务）",
+# Audit 模式时间窗倍数（零命中议题用更宽窗口扩搜）
+_AUDIT_WINDOW_MULTIPLIER = 2
+
+# ── 八维议题图（与 business_scope L3 完全对齐）──────────────────────────────
+# Plan 按这八个 L3 维度分别枚举议题。
+# L2（售前/售中/售后）由 reporter 端从 L3 派生，无需模型处理。
+DIMENSIONS: dict[str, dict] = {
+    # ── 售前 ───────────────────────────────────────────────────────────
+    "RD": {
+        "name": "RD 产品研发设计",
         "subtopics": [
-            "法定分类：以功率/速度/重量/自动化等级如何划分？是否有新分级或边界调整？",
-            "主管机构动态：型式认证机构 / 安全监管机构最近发布的官方通知、决议、Q&A、指引",
-            "市场准入流程：型式认证 / 产品注册 / 合格评定的程序变更（数字提交、简化路径等）",
-            "进口商 / 经销商义务：标签、技术文档、经济运营商注册、召回程序、尽职调查要求",
+            "机械 / 电气 / 防火 / 阻燃 标准（EN / IEC / UL / JIS / GB）",
+            "电池技术规范：IEC 62133、UL 2271/2272/2849、UN 38.3、GB/T 36972/38031、EN 50604",
+            "充电安全 / 接口 / 通信协议：USB-C 通用充电器、智能充电 / V2G 互操作",
+            "AI 与自动驾驶 / 功能安全：EU AI Act 实施细则、ISO 25119、IEC 61508、ISO 26262",
+            "网络安全 / 软件 / OTA：EU CRA、UK PSTI、UN R155 / R156、NIST IoT、ETSI EN 303 645",
+            "无线 / EMC / 频谱：EU RED 委托法规、FCC Part 15、日本 MIC、韩国 KCC、CISPR 14",
         ],
     },
-    2: {
-        "name": "D2 产品技术合规",
+    "PROD": {
+        "name": "PROD 生产 / 供应链",
         "subtopics": [
-            "机械 / 电气安全：EN / IEC / UL / JIS 等针对电动出行机器及电气消费品的新版/修订",
-            "网络安全 / 软件安全：EU CRA、UK PSTI、US NIST IoT 标签、日本 IoT 安全准则",
-            "无线 / EMC：EU RED 委托法规、FCC Part 15、日本 MIC、韩国 KCC 型式认证更新",
-            "AI 与自动驾驶（户外自主设备 / 联网 LEV）：EU AI Act 实施细则、ISO 25119、IEC 61508",
-            "化学品 / 有害物质：RoHS Annex II、REACH SVHC 候选清单、Prop 65、J-MOSS、K-RoHS",
-            "标签 / 数字产品护照 / 可持续披露：能源标签、DPP、可维修评分、CSRD 供应链尽职调查",
+            "物质限制：RoHS Annex II、REACH SVHC、Prop 65、J-MOSS、K-RoHS、PFAS 报告",
+            "关键矿产：锂钴镍石墨供应链尽职调查（EU CSDDD、Battery Reg Article 49 等）",
+            "工厂生产控制（FPC）/ 制造工艺合规",
+            "数字产品护照（DPP）/ 电池护照原料披露",
+            "供应链碳足迹（EU Battery Reg Article 7、ISO 14067）",
         ],
     },
-    3: {
-        "name": "D3 锂电池专项（全生命周期）",
+    "CERT": {
+        "name": "CERT 准入认证",
         "subtopics": [
-            "电池安全标准：IEC 62133、UL 2271/2272/2849、UN 38.3、GB/T 36972/38031、EN 50604",
-            "电池市场准入：EU Battery Regulation 2023/1542 实施细则（碳足迹、尽调、电池护照、回收材料阈值）；UK / AU EESS / 美各州 / 加拿大类似规则",
-            "电池运输：IATA DGR 新版、IMDG Code、ADR/RID、US DOT/PHMSA",
-            "充电安全 / 接口：充电器强制标准、USB-C 通用充电器扩展、智能充电 / V2G 互操作规则",
-            "电池 EPR / 回收：生产者责任登记目标、回收方案规则（EU WEEE/Battery、UK、加拿大省级、澳州）",
-            "电池消防：公寓 / 停车场 / 商业充电消防规范，室内储存禁令，喷淋 / 抑制要求",
+            "型式认证 / 产品注册 / 合格评定（DoC）的程序变更",
+            "强制认证：CCC / KC / PSE / UL / CE / UKCA",
+            "经济运营商注册 / 生产者-进口商-经销商义务主体认定",
+            "数字提交 / 简化路径 / 跨境互认协议",
         ],
     },
-    4: {
-        "name": "D4 消费者路权与渠道合规（C 端及零售端）",
+    # ── 售中 ───────────────────────────────────────────────────────────
+    "IMPORT": {
+        "name": "IMPORT 进口 / 流通",
         "subtopics": [
-            "消费者上路前置：强制第三方责任险、车辆登记/牌照、头盔、年龄、限速等终端使用要求",
-            "零售 / 电商合规：购买前年龄/资格验证、销售限制、强制安全/健康警示展示",
-            "执法行动：政府执法行动、罚款通知、产品召回、市场监管行动、违规车辆查扣令",
+            "海关分类 / 进口许可 / HS Code 调整",
+            "跨境电商监管（平台备案、清关流程）",
+            "关税 / 反倾销税 / 出口管制 / 制裁名单",
+            "危险品运输：IATA DGR、IMDG Code、ADR / RID、US DOT / PHMSA",
         ],
     },
+    "RETAIL": {
+        "name": "RETAIL 零售 / 销售合规",
+        "subtopics": [
+            "销售前年龄验证 / 资格验证 / 强制安全警示展示",
+            "强制信息披露 / 标签（在售期间）",
+            "广告限制 / 误导性宣传禁止 / 网红营销规范",
+            "平台连带责任（电商平台 / 跨境零售）",
+            "补贴 / 财政激励 / 以旧换新 / 能效标签（影响销售决策）",
+        ],
+    },
+    "USE": {
+        "name": "USE 消费者使用",
+        "subtopics": [
+            "消费者强制第三方责任险（RCA / MTPL）",
+            "车辆登记 / 牌照 / 唯一识别 / VIN / 防伪标识",
+            "驾照等级 / 年龄 / 头盔 / 反光装备 / PPE",
+            "路权（人行道 / 自行车道）/ 限速 / 载客载重 / 改装禁令",
+            "共享出行运营许可 / 电子围栏 / 强制停放区",
+            "室内充电 / 公寓 / 停车场充电消防规则",
+            "试点项目 / 上路许可 / 区域限制（trial schemes / pilot programs）",
+        ],
+    },
+    # ── 售后 ───────────────────────────────────────────────────────────
+    "ENFORCE": {
+        "name": "ENFORCE 执法 / 监管行动",
+        "subtopics": [
+            "召回令 / 缺陷公告 / 强制召回（EU Safety Gate、CPSC、SAMR、ACCC）",
+            "罚款决议 / 行政处罚",
+            "市场监管行动 / 执法通告 / 违规清单",
+            "违规改装查扣 / 强制下架",
+        ],
+    },
+    "EOL": {
+        "name": "EOL 回收 / 处置",
+        "subtopics": [
+            "EPR / WEEE / 电池回收义务、回收率目标",
+            "押金返还制度 / 生产者责任登记",
+            "报废处理流程 / 跨境废弃物转移（巴塞尔公约）",
+            "责任险（产品责任 / 回收责任 / 反垄断 / 平台连带）",
+        ],
+    },
+}
+
+# L3 → L2 派生映射（reporter 端用于按 L2 分组显示）
+DIM_TO_L2: dict[str, str] = {
+    "RD":      "售前",
+    "PROD":    "售前",
+    "CERT":    "售前",
+    "IMPORT":  "售中",
+    "RETAIL":  "售中",
+    "USE":     "售中",
+    "ENFORCE": "售后",
+    "EOL":     "售后",
 }
 
 # ── 产品覆盖范围 ──────────────────────────────────────────────────────────────
@@ -101,11 +168,23 @@ CATEGORY_GROUPS: dict[str, list[str]] = {
 
 # ── 调用参数 ──────────────────────────────────────────────────────────────────
 
-CALL_TIMEOUT = 90      # 单任务超时（秒）
-_db_lock     = threading.Lock()
+# 单任务超时（秒）。需 > ai_client 内最大重试耗时：
+#   retries=2 → 最多 3 次尝试，限流时 sleep 60s × 2 = 120s + 单次调用本身 ≈ 180s
+CALL_TIMEOUT = 240
+
+# 每议题双温度：低温捞确凿头部、高温捞长尾。
+_FETCH_TEMPS = (0.2, 1.0)
+_PLAN_TEMP   = 0.3   # 议题图要稳定但不过度收敛
+
+# 并发数（保守值；Gemini Flash 限流时会自然降速）
+_PLAN_WORKERS  = 4
+_FETCH_WORKERS = 5
+_AUDIT_WORKERS = 3
+
+_db_lock = threading.Lock()
 
 
-# ── 全球（按维度）──────────────────────────────────────────────────────────────
+# ── 公共构造块 ────────────────────────────────────────────────────────────────
 
 def _category_block() -> str:
     lines = [f"  • {p}" for p in CATEGORY_GROUPS["整机"]]
@@ -118,51 +197,168 @@ def _subtopics_block(subtopics: list[str]) -> str:
     return "\n".join(f"  {i+1}. {s}" for i, s in enumerate(subtopics))
 
 
-def _build_global_prompt(dim_id: int, quick: bool) -> str:
-    today     = datetime.now().strftime("%Y-%m-%d")
-    start_new = (datetime.now() - timedelta(days=NEW_PUBLICATION_DAYS)).strftime("%Y-%m-%d")
-    end_up    = (datetime.now() + timedelta(days=UPCOMING_DEADLINE_DAYS)).strftime("%Y-%m-%d")
-    dim       = DIMENSIONS[dim_id]
+# ── Plan 阶段：议题图枚举 ─────────────────────────────────────────────────────
+
+def _enumerate_topics(dim_id: str, quick: bool) -> list[dict]:
+    """
+    让模型枚举该维度下值得监控的议题清单。
+    议题 = 监管面，跨年度稳定；具体法规由 fetch 阶段在议题下抓取。
+
+    dim_id：八维 L3 代码之一（"RD" / "PROD" / "CERT" / "IMPORT" / "RETAIL" / "USE" / "ENFORCE" / "EOL"）。
+    quick 参数当前不影响议题图，保留是为了将来需要时能差异化。
+    返回 [{id, name, scope_hint}]，失败时 fallback 到 DIMENSIONS.subtopics。
+    """
+    _ = quick  # reserved
+    today = datetime.now().strftime("%Y-%m-%d")
+    dim   = DIMENSIONS[dim_id]
+
+    prompt = prompts.load("researcher_plan").format(
+        today=today,
+        dim_lower=dim_id.lower(),
+        dim_name=dim["name"],
+        subtopics_block=_subtopics_block(dim["subtopics"]),
+        category_block=_category_block(),
+    )
+
+    try:
+        # 议题图不需要联网搜索——它是基于模型先验知识的"应监控面清单"。
+        # 用 call_json 强制结构化输出，t=0.3 保持稳定但不过度收敛。
+        text = ai_client.call_json(
+            prompt,
+            system=prompts.load("researcher_plan_system").format(
+                business_scope=_BUSINESS_SCOPE,
+            ),
+            temperature=_PLAN_TEMP,
+        )
+        topics = parse_json_array(text) or []
+    except Exception as e:
+        _log.warning("PLAN %s failed: %s — fallback to subtopics", dim_id, e)
+        topics = []
+
+    valid: list[dict] = []
+    seen_ids: set[str] = set()
+    for t in topics:
+        if not isinstance(t, dict):
+            continue
+        tid  = (t.get("id")   or "").strip()
+        name = (t.get("name") or "").strip()
+        if not tid or not name or tid in seen_ids:
+            continue
+        seen_ids.add(tid)
+        valid.append({
+            "id":         tid,
+            "name":       name,
+            "scope_hint": (t.get("scope_hint") or "").strip(),
+        })
+
+    if not valid:
+        # Plan 失败兜底：把现有 subtopics 当议题用，至少不退化为零召回。
+        valid = [
+            {
+                "id":         f"{dim_id.lower()}-fallback-{i+1}",
+                "name":       s.split("：")[0][:20] if "：" in s else s[:20],
+                "scope_hint": s,
+            }
+            for i, s in enumerate(dim["subtopics"])
+        ]
+        _log.info("PLAN %s using subtopics fallback (%d topics)", dim_id, len(valid))
+
+    return valid
+
+
+# ── Fetch 阶段：单议题召回 ─────────────────────────────────────────────────────
+
+def _build_fetch_prompt(topic: dict, quick: bool, broaden: bool) -> str:
+    """构造单议题搜索 prompt。broaden=True 时使用更宽时间窗 + 扩搜提示。"""
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    multiplier    = _AUDIT_WINDOW_MULTIPLIER if broaden else 1
+    new_days      = NEW_PUBLICATION_DAYS   * multiplier
+    upcoming_days = UPCOMING_DEADLINE_DAYS * multiplier
+
+    start_new = (datetime.now() - timedelta(days=new_days)).strftime("%Y-%m-%d")
+    end_up    = (datetime.now() + timedelta(days=upcoming_days)).strftime("%Y-%m-%d")
 
     if quick:
         scope = prompts.load("researcher_scope_quick").format(
-            new_days=NEW_PUBLICATION_DAYS,
+            new_days=new_days,
             start_new=start_new,
         )
     else:
         scope = prompts.load("researcher_scope_full").format(
-            new_days=NEW_PUBLICATION_DAYS,
+            new_days=new_days,
             start_new=start_new,
-            upcoming_days=UPCOMING_DEADLINE_DAYS,
+            upcoming_days=upcoming_days,
             end_up=end_up,
         )
 
-    return prompts.load("researcher_global").format(
+    audit_hint = (
+        "[扩搜模式] 该议题在首轮搜索零命中。请扩大检索：\n"
+        "  • 时间窗已自动延长（详见上文）\n"
+        "  • 主动尝试本议题的次要法域、边缘机构、以前未覆盖的语言\n"
+        "  • 公示稿、咨询期文件、地方性规则、即将到期的过渡条款均纳入\n"
+        "  • 若确实无任何相关动态，输出空数组 []，不要凑数\n\n"
+    ) if broaden else ""
+
+    return prompts.load("researcher_fetch").format(
         today=today,
-        dim_name=dim["name"],
-        subtopics_block=_subtopics_block(dim["subtopics"]),
-        category_block=_category_block(),
+        topic_name=topic["name"],
+        scope_hint=topic["scope_hint"] or "（无额外提示，按议题名展开）",
         scope=scope,
+        audit_hint=audit_hint,
+        category_block=_category_block(),
         output_schema=prompts.load("researcher_output_schema"),
     )
 
 
-# ── Gemini grounding 调用 ─────────────────────────────────────────────────────
-# 发现层:高 temperature 最大化召回率(混沌搜索)。
-# 一致性靠下游去重 + 累积数据库,不靠单次调用稳定。
-
-def _call(prompt: str) -> tuple[str, list[dict]]:
-    return ai_client.call_grounded(
+def _fetch_topic(
+    topic: dict,
+    quick: bool,
+    temperature: float,
+    *,
+    broaden: bool = False,
+) -> tuple[list, list[dict]]:
+    """对单议题发起 grounded 搜索，返回 (regs, sources)。"""
+    prompt = _build_fetch_prompt(topic, quick, broaden)
+    text, sources = ai_client.call_grounded(
         prompt,
-        system=prompts.load("researcher_system"),
-        # temperature / top_p 用 ai_client 的默认值(1.0 / 0.95)
+        system=prompts.load("researcher_system").format(
+            business_scope=_BUSINESS_SCOPE,
+        ),
+        temperature=temperature,
     )
+    regs = parse_json_array(text) or []
+    return regs, sources
 
 
 # ── 入库 ───────────────────────────────────────────────────────────────────────
 
+# reg_id 垃圾值过滤——模型偶尔会塞占位文本，这里在入库前清掉。
+# 真正的"语义规范化"（如 "(EU) 2024/2847" / "Reg 2024/2847" / "CRA" 视为同一编号）
+# 留给 Stage 0 聚类阶段做。
+_REG_ID_GARBAGE = {
+    "", "null", "none", "n/a", "na", "tbd", "tba",
+    "xxx", "yyy", "zzz", "placeholder", "未知", "无", "待定",
+}
+
+
+def _clean_reg_id(raw: str) -> str | None:
+    """清洗模型自报的 reg_id；只过滤垃圾值，不做语义规范化。"""
+    if not raw:
+        return None
+    s = raw.strip().strip("\"'`").strip()
+    if not s or s.lower() in _REG_ID_GARBAGE:
+        return None
+    if len(s) < 3:
+        return None
+    # 含 XXX / TBD 占位文字符的视为脏数据
+    if any(g in s.lower() for g in ("xxxx", "tbd", "placeholder")):
+        return None
+    return s
+
+
 def _store(reg: dict, sources: list[dict]) -> bool:
-    """保存一条发现到 raw_search_results；按 reg_hash(title) 去重。"""
+    """保存一条发现到 raw_search_results；按 reg_hash(title) 跨表 30 天去重。"""
     title = (reg.get("title_original") or reg.get("title") or "").strip()
     if not title:
         return False
@@ -172,7 +368,6 @@ def _store(reg: dict, sources: list[dict]) -> bool:
 
     with _db_lock:
         with get_connection() as conn:
-            # 跨表去重：30 天窗口内任一表已有同 hash → 跳过
             if conn.execute(
                 "SELECT 1 FROM raw_search_results WHERE content_hash=? AND query_date>=?",
                 (h, cutoff),
@@ -184,14 +379,12 @@ def _store(reg: dict, sources: list[dict]) -> bool:
             ).fetchone():
                 return False
 
-            title_cn      = (reg.get("title_cn") or "").strip()[:25]   # 兜底截断（prompt 要求 ≤20，留余量）
-            explicit_url  = (reg.get("url") or "").strip()
+            title_cn       = (reg.get("title_cn") or "").strip()[:20]
+            explicit_url   = (reg.get("url") or "").strip()
             grounding_urls = [
                 s["url"] for s in sources
                 if s.get("url") and "vertexaisearch" not in s["url"]
             ]
-            # 主 URL：优先用模型给的 explicit URL（语义最准确），否则用第一个 grounding。
-            # 主 URL 之外的 grounding URL 作为 fallback，scraper 主 URL 失败时按序回退。
             seen      = {explicit_url} if explicit_url else set()
             fallbacks: list[str] = []
             for u in grounding_urls:
@@ -207,94 +400,162 @@ def _store(reg: dict, sources: list[dict]) -> bool:
                 rep_url = ""
             fallback_json = json.dumps(fallbacks[:5], ensure_ascii=False) if fallbacks else None
 
-            market_hint  = (reg.get("market_hint") or "").strip()
-            relevance    = (reg.get("relevance_note") or "").strip()
+            market_hint = (reg.get("market_hint") or "").strip()
+            relevance   = (reg.get("relevance_note") or "").strip()
+
+            # 模型自报的法规编号——下游 Stage 0 聚类的主输入。
+            # 过滤明显垃圾值（空、占位文本、纯数字 < 3 位等）。
+            reg_id_raw = (reg.get("reg_id") or "").strip()
+            reg_id     = _clean_reg_id(reg_id_raw)
 
             conn.execute("""
                 INSERT OR IGNORE INTO raw_search_results
                     (query_date, source_url, title, title_cn, snippet, priority,
                      product_category, market, content_hash, scrape_status,
-                     fallback_urls)
-                VALUES (?,?,?,?,?,'高',null,?,?,'待抓取',?)
+                     fallback_urls, reg_id)
+                VALUES (?,?,?,?,?,'高',null,?,?,'待抓取',?,?)
             """, (
                 datetime.now().isoformat(),
                 rep_url, title, title_cn, relevance[:500], market_hint,
-                h, fallback_json,
+                h, fallback_json, reg_id,
             ))
             return bool(conn.execute("SELECT changes()").fetchone()[0])
 
 
-# ── 主入口 ────────────────────────────────────────────────────────────────────
+# ── 主入口：三阶段编排 ────────────────────────────────────────────────────────
 
 def run_research(quick: bool = False) -> tuple[int, int]:
     """
-    并发执行 4 个 Gemini 调用（D1–D4 各一次），入库到 raw_search_results。
-    每个调用内由模型自行用各法域本地语言（含日韩俄）查询。
-    开始前先注入种子库(seeds.py)做保底召回。
-    返回 (inserted, skipped) — 含种子注入数量。
+    三阶段：Plan（议题图）→ Fetch（双温度召回）→ Audit（零命中补查）。
+    返回 (inserted, skipped) 与旧版签名兼容。
     """
     init_db()
 
-    # 种子保底:不依赖 AI,先把已知权威源塞进队列。
+    # 种子注入（保留旧逻辑，作为占位去重 + 黄金集标记）
     from seeds import inject_seeds, SEEDS
-    seed_in, seed_skip = inject_seeds()
-    print(f"\n  种子库:{len(SEEDS)} 条 → 新增 {seed_in},已存在跳过 {seed_skip}")
+    seed_new, seed_refreshed = inject_seeds()
+    print(f"\n  种子库：{len(SEEDS)} 条 → 新增 {seed_new}，刷新 {seed_refreshed}")
 
-    tasks: list[tuple[str, str]] = [
-        (_build_global_prompt(dim_id, quick), f"全球 · {dim['name']}")
-        for dim_id, dim in DIMENSIONS.items()
-    ]
-
-    total = len(tasks)
-    inserted = seed_in
-    skipped  = seed_skip
-    failed   = 0
     mode = "快速（仅新发布）" if quick else "全量（新发布 + 即将生效）"
-
     print(f"\n  模式：{mode}")
-    print(f"  共 {total} 个任务（D1–D4 维度，AI 自行按法域适配本地语言）\n")
 
-    def _process_task(prompt: str) -> tuple[int, int, int]:
-        text, srcs = _call(prompt)
-        regs       = parse_json_array(text) or []
-        n_in = n_sk = 0
-        for reg in regs:
-            if isinstance(reg, dict) and _store(reg, srcs):
-                n_in += 1
-            else:
-                n_sk += 1
-        return n_in, n_sk, len(regs)
-
-    completed = 0
-    future_to_label: dict = {}
+    # ── 阶段 1：Plan ───────────────────────────────────────────────────────────
+    print(f"\n  ── 阶段 1/3：议题图枚举 ──\n")
+    dim_topics: dict[int, list[dict]] = {}
 
     with concurrent.futures.ThreadPoolExecutor(
-        max_workers=5, thread_name_prefix="researcher"
-    ) as executor:
-        for prompt, label in tasks:
-            fut = executor.submit(_process_task, prompt)
-            future_to_label[fut] = label
-
-        for fut in concurrent.futures.as_completed(future_to_label):
-            completed += 1
-            label = future_to_label[fut]
-            print(f"  [{completed:>2}/{total}] {label}", end=" ... ", flush=True)
+        max_workers=_PLAN_WORKERS, thread_name_prefix="plan",
+    ) as ex:
+        plan_futs = {
+            ex.submit(_enumerate_topics, dim_id, quick): dim_id
+            for dim_id in DIMENSIONS
+        }
+        for fut in concurrent.futures.as_completed(plan_futs):
+            dim_id = plan_futs[fut]
             try:
-                n_in, n_sk, n_regs = fut.result(timeout=CALL_TIMEOUT)
+                topics = fut.result(timeout=CALL_TIMEOUT)
+            except Exception as e:
+                _log.error("PLAN FAIL %s: %s", dim_id, e)
+                topics = []
+            dim_topics[dim_id] = topics
+            dim_name = DIMENSIONS[dim_id]["name"]
+            print(f"  {dim_id} {dim_name}：{len(topics)} 议题")
+            for t in topics:
+                print(f"        • [{t['id']}] {t['name']}")
+            _log.info("PLAN %s topics=%d ids=%s",
+                      dim_id, len(topics), [t["id"] for t in topics])
+
+    # 议题平铺为 fetch 任务（每议题 × 每温度 一次调用）
+    fetch_tasks: list[tuple[int, dict, float]] = [
+        (dim_id, topic, t)
+        for dim_id, topics in dim_topics.items()
+        for topic in topics
+        for t in _FETCH_TEMPS
+    ]
+
+    # ── 阶段 2：Fetch（双温度并行）─────────────────────────────────────────────
+    total_fetch  = len(fetch_tasks)
+    total_topics = sum(len(t) for t in dim_topics.values())
+    print(f"\n  ── 阶段 2/3：议题召回（{total_topics} 议题 × {len(_FETCH_TEMPS)} 温度 = {total_fetch} 调用）──\n")
+
+    inserted = skipped = failed = 0
+    topic_hits: dict[str, int] = {tp["id"]: 0
+                                  for tps in dim_topics.values() for tp in tps}
+    completed = 0
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=_FETCH_WORKERS, thread_name_prefix="fetch",
+    ) as ex:
+        fut_meta = {
+            ex.submit(_fetch_topic, topic, quick, temp): (dim_id, topic, temp)
+            for (dim_id, topic, temp) in fetch_tasks
+        }
+        for fut in concurrent.futures.as_completed(fut_meta):
+            dim_id, topic, temp = fut_meta[fut]
+            completed += 1
+            label = f"{dim_id}/{topic['id']}/t={temp}"
+            try:
+                regs, srcs = fut.result(timeout=CALL_TIMEOUT)
+                n_in = n_sk = 0
+                for reg in regs:
+                    if isinstance(reg, dict) and _store(reg, srcs):
+                        n_in += 1
+                    else:
+                        n_sk += 1
                 inserted += n_in
                 skipped  += n_sk
-                _log.info("OK %s regs=%d new=%d dup=%d", label, n_regs, n_in, n_sk)
-                print(f"发现 {n_regs} 条  →  入库 {n_in}，重复 {n_sk}")
+                topic_hits[topic["id"]] += n_in
+                _log.info("FETCH %s regs=%d new=%d dup=%d", label, len(regs), n_in, n_sk)
+                print(f"  [{completed:>3}/{total_fetch}] {label}：{len(regs)} 条 → 入库 {n_in}，重复 {n_sk}")
             except (TimeoutError, concurrent.futures.TimeoutError):
                 failed += 1
-                _log.warning("TIMEOUT %s", label)
-                print(f"⏱ 跳过：超时（>{CALL_TIMEOUT}s）")
+                _log.warning("FETCH TIMEOUT %s", label)
+                print(f"  [{completed:>3}/{total_fetch}] {label}：⏱ 超时")
             except Exception as e:
                 failed += 1
-                _log.error("FAIL %s  %s", label, e)
-                print(f"❌  {e}")
+                _log.error("FETCH FAIL %s: %s", label, e)
+                print(f"  [{completed:>3}/{total_fetch}] {label}：❌ {e}")
 
-    suffix = f"  （{failed} 个任务调用失败）" if failed else ""
+    # ── 阶段 3：Audit（零命中议题扩搜）─────────────────────────────────────────
+    zero_hit_pairs: list[tuple[int, dict]] = [
+        (dim_id, topic)
+        for dim_id, topics in dim_topics.items()
+        for topic in topics
+        if topic_hits.get(topic["id"], 0) == 0
+    ]
+
+    if not zero_hit_pairs:
+        print(f"\n  ── 阶段 3/3：所有 {total_topics} 议题至少一次命中，跳过补查 ──")
+    else:
+        print(f"\n  ── 阶段 3/3：零命中议题补查（{len(zero_hit_pairs)}/{total_topics} 议题）──\n")
+        recovered = 0
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=_AUDIT_WORKERS, thread_name_prefix="audit",
+        ) as ex:
+            fut_meta2 = {
+                ex.submit(_fetch_topic, topic, quick, 1.0, broaden=True): (dim_id, topic)
+                for (dim_id, topic) in zero_hit_pairs
+            }
+            for fut in concurrent.futures.as_completed(fut_meta2):
+                dim_id, topic = fut_meta2[fut]
+                label = f"{dim_id}/{topic['id']}"
+                try:
+                    regs, srcs = fut.result(timeout=CALL_TIMEOUT)
+                    n_in = 0
+                    for reg in regs:
+                        if isinstance(reg, dict) and _store(reg, srcs):
+                            n_in += 1
+                    inserted  += n_in
+                    recovered += n_in
+                    _log.info("AUDIT %s regs=%d recovered=%d", label, len(regs), n_in)
+                    print(f"  [audit] {label}：{len(regs)} 条 → 补回 {n_in}")
+                except Exception as e:
+                    _log.warning("AUDIT FAIL %s: %s", label, e)
+                    print(f"  [audit] {label}：❌ {e}")
+        print(f"\n  补查完成：{recovered} 条额外法规进入流水线")
+
+    # ── 汇总 ─────────────────────────────────────────────────────────────────
+    suffix = f"  （{failed} 个调用失败）" if failed else ""
     print(f"\n  总计：入库 {inserted} 条待抓取，重复跳过 {skipped} 条{suffix}")
     return inserted, skipped
 

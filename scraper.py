@@ -6,11 +6,12 @@ Scraper：从官方 URL 抓取法规原文。
 - PDF：pdfplumber
 
 特性：
-- per-domain 速率控制（同一域两次请求间至少 1.5s）
+- 跨域并发抓取（_SCRAPE_WORKERS）+ per-domain 速率控制（同域至少 1.5s）
 - 文本超过 _MAX_CHARS 时标记 truncated=1
 """
 from __future__ import annotations
 
+import concurrent.futures
 import io
 import json
 import random
@@ -24,13 +25,19 @@ import pdfplumber
 import requests
 from bs4 import BeautifulSoup
 
+from datetime import datetime, timedelta
+
 from database import (
     init_db,
     get_pending_scrape,
     insert_scraped_content,
     update_scrape_status,
+    get_connection,
 )
 from utils import get_logger
+
+# URL 缓存 TTL：同一 URL 7 天内不重抓（法规公布后 7 天内通常不变）
+_URL_CACHE_TTL_DAYS = 7
 
 _log = get_logger("scraper")
 
@@ -44,7 +51,10 @@ _HEADERS = {
 }
 _TIMEOUT       = 25       # 单次请求超时（秒）
 _MAX_CHARS     = 60_000   # 单条记录最长保留字符数
-_MAX_PDF_PAGES = 80
+_MAX_PDF_PAGES = 200      # 单 PDF 最长保留页数（超出走头尾分段策略）
+# 头/尾分段比例：6 : 4。法规典型结构=前 60% 是定义/适用范围，
+# 后 40% 是强制日 / 罚则 / 附录——两端都不能丢。
+_PDF_HEAD_RATIO = 0.6
 _PDF_PAGE_LIMIT_REACHED = "PDF_PAGE_LIMIT"
 
 _NOISE_TAGS = ["script", "style", "nav", "header", "footer",
@@ -54,6 +64,17 @@ _NOISE_TAGS = ["script", "style", "nav", "header", "footer",
 _PER_DOMAIN_GAP = 1.5     # 同域请求间隔下限（秒）
 _domain_last_hit: dict[str, float] = defaultdict(float)
 _domain_lock = threading.Lock()
+
+# 并发控制：同时抓取的 worker 数（跨域并发，同域仍受 _PER_DOMAIN_GAP 串行）
+_SCRAPE_WORKERS = 8
+
+# 打印锁——并发时避免输出交错
+_print_lock = threading.Lock()
+
+
+def _safe_print(msg: str) -> None:
+    with _print_lock:
+        print(msg, flush=True)
 
 
 # ── EUR-Lex → Cellar 重写 ─────────────────────────────────────────────────────
@@ -178,13 +199,32 @@ def _wait_for_domain(host: str) -> None:
 
 
 def _extract_pdf(content: bytes) -> tuple[str | None, bool]:
-    """返回 (text, truncated)。truncated=True 表示页数超过 _MAX_PDF_PAGES。"""
+    """提取 PDF 文本。返回 (text, truncated)。
+
+    页数 ≤ _MAX_PDF_PAGES：完整保留。
+    超出时：取头 60% + 尾 40%（按 _PDF_HEAD_RATIO）—— 法规结构里头部含适用范围，
+    尾部含强制日 / 罚则 / 附录，两端都不能丢。中部插入省略提示。
+    """
     try:
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             n_pages = len(pdf.pages)
-            pages = [p.extract_text() or "" for p in pdf.pages[:_MAX_PDF_PAGES]]
-        text = "\n".join(pages).strip()
-        return (text or None, n_pages > _MAX_PDF_PAGES)
+            if n_pages <= _MAX_PDF_PAGES:
+                pages = [p.extract_text() or "" for p in pdf.pages]
+                text = "\n".join(pages).strip()
+                return (text or None, False)
+
+            head_n = int(_MAX_PDF_PAGES * _PDF_HEAD_RATIO)
+            tail_n = _MAX_PDF_PAGES - head_n
+            head_pages = [p.extract_text() or "" for p in pdf.pages[:head_n]]
+            tail_pages = [p.extract_text() or "" for p in pdf.pages[-tail_n:]]
+            omitted = n_pages - head_n - tail_n
+            text = (
+                "\n".join(head_pages).strip()
+                + f"\n\n[...中部 {omitted} 页（共 {n_pages} 页）已省略，"
+                  f"保留前 {head_n} 页适用范围 + 后 {tail_n} 页强制日/罚则/附录...]\n\n"
+                + "\n".join(tail_pages).strip()
+            )
+        return (text.strip() or None, True)
     except Exception as e:
         _log.warning("PDF parse failed: %s", e)
         return (None, False)
@@ -312,10 +352,99 @@ def _try_scrape_chain(row) -> tuple[str | None, str, bool, str | None]:
     return None, "unknown", False, None
 
 
-def scrape_all() -> tuple[int, int, int]:
+def _check_url_cache(url: str, ttl_days: int = _URL_CACHE_TTL_DAYS) -> tuple[str | None, str | None]:
+    """查 url 是否在 ttl_days 内已被成功抓取过；命中则返回 (cached_text, content_type)。
+
+    注：跨 raw_search_results 行复用——同 URL 不同条目（不同议题召回到同一法规）
+    第一次抓取后，其余直接复用文本，避免 HTTP 重抓 + 频率限制。
+    """
+    if not url:
+        return None, None
+    cutoff = (datetime.now() - timedelta(days=ttl_days)).isoformat()
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT sc.full_text, sc.content_type
+            FROM scraped_content sc
+            JOIN raw_search_results rs ON rs.id = sc.raw_id
+            WHERE rs.source_url = ?
+              AND sc.scrape_date >= ?
+              AND sc.full_text IS NOT NULL
+              AND length(sc.full_text) > 200
+            ORDER BY sc.scrape_date DESC
+            LIMIT 1
+        """, (url, cutoff)).fetchone()
+    if row and row["full_text"]:
+        return row["full_text"], (row["content_type"] or "unknown")
+    return None, None
+
+
+def _scrape_one(idx: int, total: int, row, force_refresh: bool) -> str:
+    """处理一条 pending row。返回 'ok'/'fail'/'manual'/'cached'。"""
+    url   = _row_get(row, "source_url")
+    title = (_row_get(row, "title") or "")[:50]
+    head  = f"  [{idx:>3}/{total}] {title}"
+
+    if not url and not _row_get(row, "fallback_urls"):
+        update_scrape_status(row["id"], "需人工")
+        _safe_print(f"{head}  无 URL → 需人工")
+        return "manual"
+
+    # URL 缓存命中（7 天内同 URL 已被成功抓取）
+    if not force_refresh and url:
+        cached_text, cached_type = _check_url_cache(url)
+        if cached_text:
+            try:
+                insert_scraped_content({
+                    "raw_id":       row["id"],
+                    "full_text":    cached_text,
+                    "content_type": cached_type,
+                    "truncated":    0,
+                })
+                update_scrape_status(row["id"], "已抓取")
+                _safe_print(f"{head}  ♻ 缓存命中 ({len(cached_text):,} chars)")
+                return "cached"
+            except Exception as db_err:
+                _log.warning("cache reuse failed raw_id=%d: %s", row["id"], db_err)
+                # 落到正常抓取流程
+
+    text, ctype, truncated, used_url = _try_scrape_chain(row)
+    try:
+        if text:
+            insert_scraped_content({
+                "raw_id":       row["id"],
+                "full_text":    text,
+                "content_type": ctype,
+                "truncated":    1 if truncated else 0,
+            })
+            # 若成功 URL 与主 URL 不同，回写为新的 source_url（便于后续追溯）
+            if used_url and used_url != url:
+                with get_connection() as conn:
+                    conn.execute(
+                        "UPDATE raw_search_results SET source_url=? WHERE id=?",
+                        (used_url, row["id"]),
+                    )
+            update_scrape_status(row["id"], "已抓取")
+            trunc_tag    = " ✂截断" if truncated else ""
+            fallback_tag = " ↩fallback" if used_url and used_url != url else ""
+            _safe_print(f"{head}  ✓ {ctype}  ({len(text):,} chars){trunc_tag}{fallback_tag}")
+            return "ok"
+        else:
+            update_scrape_status(row["id"], "失败")
+            _safe_print(f"{head}  ✗ 抓取失败")
+            return "fail"
+    except Exception as db_err:
+        _log.error("DB write failed raw_id=%d: %s", row["id"], db_err)
+        _safe_print(f"{head}  ✗ 数据库写入失败")
+        return "fail"
+
+
+def scrape_all(force_refresh: bool = False) -> tuple[int, int, int]:
     """
     抓取所有 scrape_status='待抓取' 的记录。
+    force_refresh=True 时跳过 URL 缓存，强制重新抓取。
     返回 (succeeded, failed, manual)。
+
+    跨域并发（_SCRAPE_WORKERS=8）+ 同域 1.5s 串行（_PER_DOMAIN_GAP）。
     """
     init_db()
     pending = get_pending_scrape()
@@ -323,56 +452,29 @@ def scrape_all() -> tuple[int, int, int]:
         print("  没有待抓取的记录。")
         return 0, 0, 0
 
-    total     = len(pending)
-    succeeded = failed = manual = 0
+    total = len(pending)
+    cache_label = "（强制刷新）" if force_refresh else f"（{_URL_CACHE_TTL_DAYS} 天 URL 缓存生效）"
+    print(f"\n  共 {total} 条待抓取（并发 {_SCRAPE_WORKERS}）{cache_label}\n")
 
-    print(f"\n  共 {total} 条待抓取\n")
+    def _process(args):
+        idx, row = args
+        return _scrape_one(idx, total, row, force_refresh)
 
-    for i, row in enumerate(pending, 1):
-        url   = _row_get(row, "source_url")
-        title = (_row_get(row, "title") or "")[:50]
-        print(f"  [{i:>3}/{total}] {title}", end=" ... ", flush=True)
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=_SCRAPE_WORKERS, thread_name_prefix="scrape",
+    ) as ex:
+        results = list(ex.map(_process, list(enumerate(pending, 1))))
 
-        if not url and not _row_get(row, "fallback_urls"):
-            update_scrape_status(row["id"], "需人工")
-            manual += 1
-            print("无 URL → 需人工")
-            continue
+    succeeded = sum(1 for r in results if r in ("ok", "cached"))
+    cached    = sum(1 for r in results if r == "cached")
+    failed    = sum(1 for r in results if r == "fail")
+    manual    = sum(1 for r in results if r == "manual")
 
-        text, ctype, truncated, used_url = _try_scrape_chain(row)
-        try:
-            if text:
-                insert_scraped_content({
-                    "raw_id":       row["id"],
-                    "full_text":    text,
-                    "content_type": ctype,
-                    "truncated":    1 if truncated else 0,
-                })
-                # 若成功 URL 与主 URL 不同，回写为新的 source_url（便于后续追溯）
-                if used_url and used_url != url:
-                    from database import get_connection
-                    with get_connection() as conn:
-                        conn.execute(
-                            "UPDATE raw_search_results SET source_url=? WHERE id=?",
-                            (used_url, row["id"]),
-                        )
-                update_scrape_status(row["id"], "已抓取")
-                succeeded += 1
-                trunc_tag    = " ✂截断" if truncated else ""
-                fallback_tag = " ↩fallback" if used_url and used_url != url else ""
-                print(f"✓ {ctype}  ({len(text):,} chars){trunc_tag}{fallback_tag}")
-            else:
-                update_scrape_status(row["id"], "失败")
-                failed += 1
-                print("✗ 抓取失败")
-        except Exception as db_err:
-            failed += 1
-            _log.error("DB write failed raw_id=%d: %s", row["id"], db_err)
-            print("✗ 数据库写入失败")
-
-    print(f"\n  抓取完成：成功 {succeeded}，失败 {failed}，无 URL {manual}")
+    cache_tag = f"（其中缓存命中 {cached}）" if cached else ""
+    print(f"\n  抓取完成：成功 {succeeded}{cache_tag}，失败 {failed}，无 URL {manual}")
     return succeeded, failed, manual
 
 
 if __name__ == "__main__":
-    scrape_all()
+    import sys
+    scrape_all(force_refresh="--force-refresh" in sys.argv)
