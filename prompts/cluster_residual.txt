@@ -1,0 +1,37 @@
+以下 {n} 个候选条目的 reg_id 通过正则无法识别（落入 RAW/ 兜底键），
+现在让你做语义聚类——**把指向同一份法规的条目放进同一组**。
+
+格式：[ID] 标题 | reg_id | market | snippet 摘要
+
+{entries}
+
+任务：识别"实质代表同一份法规"的条目组。
+
+判定示例（务必按这个粒度聚类）：
+  ✅ 应合并：
+     [10] Basel Convention E-waste Amendments (Decision BC-15/18) | Basel BC-15/18 | 全球
+     [27] Basel Convention E-waste Amendments (Decisions BC-15/18) | BC-15/18 | 全球
+     → 同一份巴塞尔决议，标题单复数差异不影响
+
+  ✅ 应合并：
+     [33] OECD Decision C(2001)107/FINAL on Transboundary Movements | OECD C(2001)107 | OECD
+     [41] OECD C(2001)107/FINAL — Control of Transboundary Movements of Wastes | C(2001)107/FINAL | OECD
+     → 同一 OECD 决议的不同表述
+
+  ❌ 不要合并：
+     [12] EU Battery Regulation 2023/1542 — 技术规范条款 | EU/2023/1542
+     [15] EU Battery Regulation 2023/1542 — EPR 回收义务条款 | EU/2023/1542
+     → 同一法规但不同实质条款（不同 dims），让 Stage 3 维度判定，本阶段保留独立
+
+  ❌ 不要合并：
+     [22] Basel BC-15/18 e-waste amendments | 全球
+     [28] Basel BC-14/12 hazardous waste guidelines | 全球
+     → 同一公约但不同决议号，独立法规
+
+输出严格 JSON 数组（无可合并组 → []，不含任何说明文字）：
+[
+  {{
+    "group_ids": [整数 ID 列表，至少 2 个],
+    "reason":    "一句话说明为何判定同一法规（指出共同的法规身份）"
+  }}
+]

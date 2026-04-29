@@ -21,11 +21,29 @@ import json
 import re
 from collections import defaultdict
 
+import ai_client
 import authority
+import prompts
 from database import get_connection
-from utils import get_logger
+from utils import get_logger, parse_json_array
 
 _log = get_logger("consolidator")
+
+# Stage 0 LLM 聚类参数
+_LLM_CLUSTER_BATCH       = 40   # 单次 LLM 调用最多比较的候选数
+_LLM_CLUSTER_MIN_GROUP   = 2    # 启动 LLM 的最小候选数
+_JACCARD_PREFILTER_MIN   = 0.25 # token Jaccard 粗筛阈值（< 此值不参与 LLM 比较）
+
+# title 分词停用词——剥离常见法规噪声词后做 Jaccard 粗筛，
+# 避免"Decision/Regulation/Notice"等高频词污染相似度
+_TITLE_STOPWORDS = {
+    "the", "of", "and", "or", "for", "to", "a", "an", "on", "in", "with",
+    "act", "regulation", "regulations", "directive", "decision", "decisions",
+    "amendment", "amendments", "notice", "order", "rule", "rules",
+    "draft", "final", "implementing", "delegated", "consultation",
+    "law", "code", "standard", "standards", "guidelines", "guideline",
+    "通知", "公告", "决议", "决定", "通告", "法令", "条例", "规定",
+}
 
 
 # ── reg_id 归一化 ──────────────────────────────────────────────────────────────
@@ -128,6 +146,165 @@ def normalize_reg_id(raw: str | None) -> str | None:
     return None
 
 
+# ── LLM 语义聚类（reg_id 正则失效时的兜底）────────────────────────────────────
+#
+# 设计意图：
+#   reg_id 正则只能识别已枚举的格式（CELEX / EU / CFR / GB / 别名…）。
+#   遇到 "Basel BC-15/18" / "OECD C(2001)107" 这类未枚举编号，正则
+#   会走 RAW/<原值压缩> 兜底——同一法规不同写法（"Decision" vs "Decisions"、
+#   带/不带前缀词）会落到不同 RAW key，根本不会被合并。
+#
+#   这个阶段让 LLM 用语义判断"是否同一法规"——人 1 秒能看出来的，
+#   AI 也应该能。每周 1 次低成本调用，根治正则覆盖盲区。
+#
+# 性能保护：
+#   1. token Jaccard 粗筛：不相关条目对不进入 LLM（O(n²) → 实际 O(候选对数)）
+#   2. 单次 LLM 调用上限 _LLM_CLUSTER_BATCH 条
+#   3. 失败时自动降级：保留原 RAW/ 兜底，不阻断 pipeline
+
+
+def _title_tokens(title: str | None, reg_id: str | None) -> set[str]:
+    """提取标题 + reg_id 的语义 token 集（剥离停用词、标点、大小写）。"""
+    text = f"{title or ''} {reg_id or ''}".lower()
+    # 拆分：英文按字母/数字串，中文按字符（粗略但够用做粗筛）
+    tokens = set()
+    for t in re.findall(r"[a-z0-9][a-z0-9\-/]*", text):
+        if len(t) >= 2 and t not in _TITLE_STOPWORDS:
+            tokens.add(t)
+    for ch in re.findall(r"[一-鿿]+", text):
+        for c in ch:
+            if c not in _TITLE_STOPWORDS:
+                tokens.add(c)
+    return tokens
+
+
+def _has_similar_pair(rows: list, min_jaccard: float = _JACCARD_PREFILTER_MIN) -> bool:
+    """快速判定该候选组里是否存在至少一对 Jaccard ≥ 阈值——存在才值得调 LLM。"""
+    token_sets = [_title_tokens(r["title"], r["reg_id"]) for r in rows]
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            a, b = token_sets[i], token_sets[j]
+            if not a or not b:
+                continue
+            inter = len(a & b)
+            union = len(a | b)
+            if union and inter / union >= min_jaccard:
+                return True
+    return False
+
+
+def _llm_cluster_residual(rows: list, business_scope: str) -> list[list[int]]:
+    """对 RAW/ 兜底的残余候选调一次 LLM 做语义聚类。
+    返回 [[id, id, ...], ...]，每组至少 2 个 ID。失败时返回 []。
+    """
+    if len(rows) < _LLM_CLUSTER_MIN_GROUP:
+        return []
+    if not _has_similar_pair(rows):
+        # 候选两两都不相似——LLM 大概率也找不出合并，省一次调用
+        return []
+
+    entries = ""
+    valid_ids: set[int] = set()
+    for r in rows[:_LLM_CLUSTER_BATCH]:
+        valid_ids.add(r["id"])
+        title  = (r["title"] or "")[:120]
+        reg_id = (r["reg_id"] or "—")[:60]
+        market = (r["market"] or "—")[:30]
+        snip   = (r["snippet"] or "").replace("\n", " ")[:80]
+        entries += f"[{r['id']}] {title} | {reg_id} | {market} | {snip}\n"
+
+    system = prompts.load("cluster_residual_system").format(business_scope=business_scope)
+    prompt = prompts.load("cluster_residual").format(n=len(valid_ids), entries=entries)
+
+    try:
+        resp = ai_client.call_json(prompt, system=system)
+    except Exception as e:
+        _log.warning("Stage 0 LLM cluster failed: %s", e)
+        return []
+
+    parsed = parse_json_array(resp) or []
+    clusters: list[list[int]] = []
+    seen: set[int] = set()
+    for g in parsed:
+        if not isinstance(g, dict):
+            continue
+        gids = g.get("group_ids") or []
+        if not isinstance(gids, list) or len(gids) < 2:
+            continue
+        # 校验：所有 ID 都在本批次、且未在之前的组里出现过
+        if not all(isinstance(i, int) and i in valid_ids for i in gids):
+            continue
+        if any(i in seen for i in gids):
+            continue
+        seen.update(gids)
+        reason = (g.get("reason") or "")[:120]
+        _log.info("STAGE0-LLM cluster ids=%s reason=%s", gids, reason)
+        clusters.append(gids)
+    return clusters
+
+
+def _apply_clusters(rows_by_id: dict, clusters: list[list[int]], verbose: bool) -> tuple[int, int]:
+    """对 LLM 输出的聚类执行合并（与 reg_id 合并相同的 keeper / consolidated_into 机制）。"""
+    groups_merged = rows_merged = 0
+    for gids in clusters:
+        members = [rows_by_id[i] for i in gids if i in rows_by_id]
+        if len(members) < 2:
+            continue
+
+        all_urls: list[str] = []
+        for m in members:
+            if m["source_url"]:
+                all_urls.append(m["source_url"])
+            if m["fallback_urls"]:
+                try:
+                    fb = json.loads(m["fallback_urls"])
+                    if isinstance(fb, list):
+                        all_urls.extend(u for u in fb if isinstance(u, str))
+                except Exception:
+                    pass
+        ranked = authority.sort_by_authority(all_urls)
+        primary_url = ranked[0] if ranked else (members[0]["source_url"] or "")
+        fallback_list = ranked[1:6]
+        fallback_json = json.dumps(fallback_list, ensure_ascii=False) if fallback_list else None
+
+        keeper = max(
+            members,
+            key=lambda r: (
+                authority.score(r["source_url"] or ""),
+                1 if (r["source_url"] or "") == primary_url else 0,
+                -r["id"],
+            ),
+        )
+        merged = [m for m in members if m["id"] != keeper["id"]]
+
+        markets: list[str] = []
+        for m in members:
+            for part in (p.strip() for p in (m["market"] or "").split("、") if p.strip()):
+                if part not in markets:
+                    markets.append(part)
+        merged_market = "、".join(markets)
+
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE raw_search_results "
+                "SET source_url=?, fallback_urls=?, market=? WHERE id=?",
+                (primary_url, fallback_json, merged_market, keeper["id"]),
+            )
+            for m in merged:
+                conn.execute(
+                    "UPDATE raw_search_results "
+                    "SET consolidated_into=?, scrape_status='已抓取' WHERE id=?",
+                    (keeper["id"], m["id"]),
+                )
+
+        groups_merged += 1
+        rows_merged += len(merged)
+        if verbose:
+            sample = " / ".join((m["title"] or "")[:30] for m in members[:3])
+            print(f"  ✓ [LLM 语义] keep={keeper['id']} merge {len(merged)} 条  [{sample}]")
+    return groups_merged, rows_merged
+
+
 # ── Stage 0 主流程 ────────────────────────────────────────────────────────────
 
 def consolidate_pending(verbose: bool = True) -> tuple[int, int, int]:
@@ -174,6 +351,7 @@ def consolidate_pending(verbose: bool = True) -> tuple[int, int, int]:
 
     groups_merged = 0
     rows_merged = 0
+    already_merged_ids: set[int] = set()  # 给 LLM 阶段：本轮已被 reg_id 合并的从条目
 
     for key in mergeable_keys:
         members = groups[key]
@@ -231,6 +409,7 @@ def consolidate_pending(verbose: bool = True) -> tuple[int, int, int]:
 
         groups_merged += 1
         rows_merged += len(merged)
+        already_merged_ids.update(m["id"] for m in merged)
         _log.info(
             "STAGE0 key=%s keeper=%d merged=%s primary_url=%s",
             key, keeper["id"], [m["id"] for m in merged], primary_url[:80],
@@ -239,11 +418,38 @@ def consolidate_pending(verbose: bool = True) -> tuple[int, int, int]:
             sample = " / ".join((m["title"] or "")[:30] for m in members[:3])
             print(f"  ✓ [{key}] keep={keeper['id']} merge {len(merged)} 条  [{sample}]")
 
+    # ── LLM 语义聚类：对 RAW/ 兜底键 + 无 reg_id 的残余候选再扫一遍 ───────
+    # reg_id 正则只能识别已枚举编号格式；遇到 "Basel BC-15/18" 这类
+    # 非标准编号会落入 RAW/<原值>，同一法规不同写法 key 不同 → 漏合并。
+    # LLM 用语义判断"是否同一法规"——人 1 秒能看出来的，AI 也应该能。
+    residual_ids: set[int] = {r["id"] for r in no_key}
+    for k, members in groups.items():
+        if k.startswith("RAW/"):
+            residual_ids.update(m["id"] for m in members)
+    residual_ids -= already_merged_ids   # 已被 reg_id 合并的从条目不参与
+    residual = [r for r in rows if r["id"] in residual_ids]
+
+    llm_groups = llm_rows = 0
+    if len(residual) >= _LLM_CLUSTER_MIN_GROUP:
+        if verbose:
+            print(f"\n  ── Stage 0+：LLM 语义聚类（{len(residual)} 条残余候选）──")
+        # 引入 BUSINESS_SCOPE 作为系统判定基础
+        from analyzer._shared import BUSINESS_SCOPE
+        clusters = _llm_cluster_residual(residual, BUSINESS_SCOPE)
+        if clusters:
+            rows_by_id = {r["id"]: r for r in residual}
+            llm_groups, llm_rows = _apply_clusters(rows_by_id, clusters, verbose)
+            groups_merged += llm_groups
+            rows_merged   += llm_rows
+        elif verbose:
+            print(f"  LLM 判定：无可合并语义组")
+
     untouched = len(rows) - rows_merged
 
     if verbose:
         if groups_merged:
-            print(f"\n  完成：{groups_merged} 组合并 {rows_merged} 条 → 留 {untouched} 条独立走 scrape")
+            extra = f"（其中 LLM 合并 {llm_groups} 组 / {llm_rows} 条）" if llm_groups else ""
+            print(f"\n  完成：{groups_merged} 组合并 {rows_merged} 条 → 留 {untouched} 条独立走 scrape {extra}")
         else:
             print(f"  完成：无可合并组")
 

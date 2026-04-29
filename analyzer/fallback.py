@@ -121,15 +121,22 @@ def enforce_fallback_caps(result: dict) -> None:
 
 
 def requeue_navigation_failures() -> int:
-    """把误判为'不相关'的导航页/索引页转入降级合成队列。"""
+    """把空壳/导航页/极短抓取转入降级合成队列。
+
+    早期版本依赖 AI 主分析自报 affected_products='不相关'——但 AI 看到
+    知名法规标题（如 "Basel Convention BC-15/18"）时，会拿训练知识凭空
+    "自信合成"，根本不自报"不相关"，从而绕过此关卡。
+
+    现在改为不依赖 AI 自报：只要 full_text 长度低于导航页阈值就判定
+    主分析不可信，强制重走 grounded 合成路径并打 ⚠️ AI 合成 标识。
+    """
     with get_connection() as conn:
         rows = conn.execute("""
             SELECT ca.id, rs.id AS raw_id, rs.title
             FROM compliance_analysis ca
             JOIN scraped_content sc ON sc.id = ca.scraped_id
             JOIN raw_search_results rs ON rs.id = sc.raw_id
-            WHERE ca.affected_products = '不相关'
-              AND (sc.full_text IS NULL OR sc.full_text NOT LIKE '[Gemini synthesis]%')
+            WHERE (sc.full_text IS NULL OR sc.full_text NOT LIKE '[Gemini synthesis]%')
               AND (sc.full_text IS NULL OR length(sc.full_text) < ?)
         """, (_NAV_PAGE_CHAR_THRESHOLD,)).fetchall()
 

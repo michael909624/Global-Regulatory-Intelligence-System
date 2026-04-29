@@ -61,6 +61,38 @@ _PDF_PAGE_LIMIT_REACHED = "PDF_PAGE_LIMIT"
 _NOISE_TAGS = ["script", "style", "nav", "header", "footer",
                "aside", "noscript", "form", "iframe"]
 
+# ── 占位 / 空壳页检测 ─────────────────────────────────────────────────────────
+# 抓到的"成功响应"里仍有大量软失败：CMS 首页占位、JS 渲染壳、Cloudflare 拦截、
+# 软 404 等——HTTP 200 OK 但正文极短或全是模板。这些落到 analyzer 主分析会
+# 让 AI 拿着标题凭空"分析"，是报告里假数据的主要来源。
+#
+# 命中即视为本 candidate 抓取失败，外层会继续走 fallback URL；全失败时
+# raw 标 '失败'，由 analyzer/fallback.py 的 grounded 合成路径接管，
+# 合成结果带 ⚠️ AI 合成 标识。
+_MIN_TEXT_CHARS = 200
+_PLACEHOLDER_MARKS = (
+    "home page", "page not found", "access denied",
+    "just a moment", "enable javascript", "cloudflare",
+    "您访问的页面不存在", "请开启 javascript",
+)
+
+
+def _looks_like_placeholder(text: str | None, title: str | None) -> str | None:
+    """返回失败原因；None 表示通过。"""
+    if not text:
+        return "无内容"
+    body = text.strip()
+    n = len(body)
+    if n < _MIN_TEXT_CHARS:
+        return f"内容过短({n}字符)"
+    t = (title or "").strip()
+    if n < 800 and t and t in body:
+        return "正文≈标题（疑似占位/导航页）"
+    low = body.lower()
+    if n < 1500 and any(m in low for m in _PLACEHOLDER_MARKS):
+        return "命中占位页特征"
+    return None
+
 # per-domain 速率控制
 _PER_DOMAIN_GAP = 1.5     # 同域请求间隔下限（秒）
 _domain_last_hit: dict[str, float] = defaultdict(float)
@@ -359,8 +391,16 @@ def _try_scrape_chain(row) -> tuple[str | None, str, bool, str | None]:
 
     for url in candidates:
         text, ctype, truncated = scrape_url(url)
-        if text:
-            return text, ctype, truncated, url
+        if not text:
+            continue
+        # 占位/空壳检测：命中则视为本 candidate 失败，继续下一个；
+        # 全部 candidate 都是空壳 → 返回 None → _scrape_one 标 raw='失败'
+        # → analyzer/fallback 路径接管，用 grounded 合成（带 ⚠️）
+        reason = _looks_like_placeholder(text, title)
+        if reason:
+            _log.warning("占位页拒收 %s: %s", url, reason)
+            continue
+        return text, ctype, truncated, url
 
     return None, "unknown", False, None
 
