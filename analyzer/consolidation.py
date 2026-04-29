@@ -58,6 +58,22 @@ _CONSOLIDATION_SYSTEM      = prompts.load("consolidation_system").format(
 )
 _CONSOLIDATION_PROMPT_TMPL = prompts.load("consolidation")
 
+# 矛盾措辞检测——LLM 自报"尽管/侧重点不同/分别关注/一项..另一项"等措辞时，
+# reason 本身就承认候选有实质差异，按"维度独立"原则不应合并。
+# 这是 Pass 2 分组放宽（dims 软聚类）后的副作用兜底——LLM 候选范围变大
+# 后倾向积极合并，事后过滤掉自相矛盾的 reason。
+_CONTRADICTION_RE = re.compile(
+    r"尽管|虽然|侧重点不同|分别关注|分别针对|分别涉及|"
+    r"一项[关聚针描](?:注|焦|对|述)|另一项|"
+    r"although|despite|however|whereas",
+    re.IGNORECASE,
+)
+
+
+def _is_contradictory(reason: str | None) -> bool:
+    """reason 含矛盾措辞 → 视为过度合并嫌疑，应拒收。"""
+    return bool(reason and _CONTRADICTION_RE.search(reason))
+
 _CONSOLIDATION_QUERY = """
     SELECT ca.id, rs.title, rs.source_url, rs.reg_id, ca.affected_markets,
            ca.impact_level, ca.affected_products, ca.business_dimensions,
@@ -212,6 +228,13 @@ def _llm_consolidate_group(group: list, topic_hint: str, all_ids: set[int]) -> t
             or not all(gid in all_ids for gid in gids)
             or any(gid in used for gid in gids)
         ):
+            continue
+
+        # Pass 2 兜底：LLM 自己说出"尽管/侧重点不同/分别关注..."的合并大概率
+        # 是过度积极。reason 自相矛盾就拒收——按"维度独立"原则保留独立条目。
+        if _is_contradictory(reason):
+            _log.info("REJECT contradictory merge group=%s reason=%s", gids, reason)
+            print(f"  ⊘ 拒收矛盾合并：{reason[:60]}")
             continue
 
         used.update(gids)
