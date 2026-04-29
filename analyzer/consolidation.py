@@ -252,39 +252,80 @@ def run_consolidation() -> tuple[int, int]:
     if len(rows) <= 1:
         return pre_m, pre_d
 
-    # ── Pass 2：维度同质度 LLM 合并 ────────────────────────────────────────
-    # 按 (sorted business_dimensions, affected_products) 分组——
-    # consolidation prompt 已强调"维度不同不合并"，分组键先做这一层过滤，
-    # 让 LLM 看到的候选同质度高，调用 ROI 提升。
-    # 同时过滤 affected_products='不相关'：这些行已被 reporter 排除，
-    # 不应再消耗 LLM 调用。
-    topic_groups: dict[tuple, list] = defaultdict(list)
+    # ── Pass 2：分组策略 ──────────────────────────────────────────────────
+    # 旧版用 (sorted dims, products) 严格相等才同组——dims 集合差一个元素就分流，
+    # 同一法规两条记录（dims=["IMPORT","EOL"] vs ["ENFORCE","EOL","IMPORT"]）
+    # 进不了同一 LLM batch，错失合并（Basel 历史漏判根因）。
+    #
+    # 新版改为两步：
+    #   Step 1：按 (products, impact) 初步分组（产品/重要度差异属"独立法规"信号）
+    #   Step 2：同子组内对 dims 用 connected components 软聚类——
+    #           dims 集合有交集即视为同候选池（"主维度重叠"判断）。
+    # 这样 dims 完全相等仍然同组，dims 略有差异（高度重叠）也合并到同 batch
+    # 让 LLM 判定，dims 完全不相干（如 RD vs USE）才分到不同 batch。
+    def _parse_dims(r) -> set[str]:
+        try:
+            arr = json.loads(r["business_dimensions"] or "[]")
+            return {d for d in arr if isinstance(d, str)} if isinstance(arr, list) else set()
+        except Exception as e:
+            _log.warning("dim parse fail id=%d: %s", r["id"], e)
+            return set()
+
+    def _dim_components(members: list) -> list[list]:
+        """同 (products, impact) 子组内按 dims 交集做 connected components。"""
+        n = len(members)
+        parent = list(range(n))
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        dim_sets = [_parse_dims(m) for m in members]
+        for i in range(n):
+            for j in range(i + 1, n):
+                a, b = dim_sets[i], dim_sets[j]
+                # 至少一方无 dim → 视为待合并候选（让 LLM 判断）；都非空 → 看交集
+                if not a or not b or (a & b):
+                    ra, rb = find(i), find(j)
+                    if ra != rb:
+                        parent[ra] = rb
+        clusters: dict = defaultdict(list)
+        for i in range(n):
+            clusters[find(i)].append(members[i])
+        return list(clusters.values())
+
+    prelim_groups: dict[tuple, list] = defaultdict(list)
     for r in rows:
         if (r["affected_products"] or "") == "不相关":
             continue
-        try:
-            dim_arr = json.loads(r["business_dimensions"] or "[]")
-            if not isinstance(dim_arr, list):
-                dim_arr = []
-        except Exception as e:
-            _log.warning("dim parse fail id=%d: %s", r["id"], e)
-            dim_arr = []
-        dims_key = tuple(sorted(d for d in dim_arr if isinstance(d, str)))
-        key = (dims_key or ("无维度",), r["affected_products"] or "未知")
-        topic_groups[key].append(r)
+        products = r["affected_products"] or "未知"
+        impact   = r["impact_level"] or "?"
+        prelim_groups[(products, impact)].append(r)
+
+    topic_groups: dict[tuple, list] = {}
+    for (products, impact), members in prelim_groups.items():
+        if len(members) < 2:
+            continue
+        for c_idx, cluster in enumerate(_dim_components(members)):
+            if len(cluster) < 2:
+                continue
+            # 用簇内 dims 并集作为 topic_hint 显示
+            dims_union = sorted({d for m in cluster for d in _parse_dims(m)})
+            dims_label = "/".join(dims_union) if dims_union else "无维度"
+            topic_groups[(dims_label, products, impact, c_idx)] = cluster
 
     all_ids       = {r["id"] for r in rows}
     merged_total  = pre_m
     deleted_total = pre_d
 
     # 收集所有 LLM 任务（每个 batch 一次调用），并发执行
-    # 注：不同 (维度集, 产品) 组的 ca.id 互斥，分批 slice 也互斥 → 无 DELETE 冲突
+    # 注：不同 (产品, 重要度, dim 簇) 组的 ca.id 互斥，分批 slice 也互斥 → 无 DELETE 冲突
     tasks: list[tuple[list, str]] = []
     for key, grp in topic_groups.items():
         if len(grp) < 2:
             continue
-        dims_label = "/".join(key[0]) if key[0] != ("无维度",) else "无维度"
-        topic_hint = f"维度={dims_label} / 产品={key[1]}"
+        dims_label, products, impact, _c_idx = key
+        topic_hint = f"维度={dims_label} / 产品={products} / 重要度={impact}"
         for i in range(0, len(grp), _CONSOLIDATION_GROUP_LIMIT):
             batch = grp[i : i + _CONSOLIDATION_GROUP_LIMIT]
             if len(batch) < 2:

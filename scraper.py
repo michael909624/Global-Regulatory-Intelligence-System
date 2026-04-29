@@ -76,8 +76,155 @@ _PLACEHOLDER_MARKS = (
     "您访问的页面不存在", "请开启 javascript",
 )
 
+# 标题/内容相关性 —— 第一性必要条件检测：
+# 真法规页必然包含自己的标识（编号、缩写、关键词）。命中率 < 阈值
+# = 抓到的不是这份法规（典型场景：URL 是 host-only，抓回的是首页全文，
+# 看似内容充足但跟标题完全无关，AI 主分析会凭训练知识凭空发挥）。
+_TITLE_HIT_RATE = 0.30   # 至少命中 30% 的核心 token
 
-def _looks_like_placeholder(text: str | None, title: str | None) -> str | None:
+# title token 提取的停用词——剥离常见法规修饰词后再做命中率判断
+_TITLE_STOPWORDS_EN = {
+    "the", "of", "and", "or", "for", "to", "a", "an", "on", "in", "with",
+    "by", "as", "is", "be", "act", "regulation", "regulations", "directive",
+    "decision", "decisions", "amendment", "amendments", "notice", "order",
+    "rule", "rules", "draft", "final", "implementing", "delegated",
+    "consultation", "law", "code", "standard", "standards", "guidelines",
+    "guideline", "no", "part", "section", "annex", "article",
+}
+_TITLE_STOPWORDS_DE = {
+    "der", "die", "das", "und", "oder", "von", "zur", "über", "für",
+    "verordnung", "richtlinie", "gesetz", "anordnung", "änderung",
+    "durchführung", "entwurf",
+}
+_TITLE_STOPWORDS_CJK = {
+    "通知", "公告", "决议", "决定", "通告", "法令", "条例", "规定",
+    "公示", "草案", "修订", "修改", "实施", "细则", "办法",
+}
+_ALL_TITLE_STOPWORDS = _TITLE_STOPWORDS_EN | _TITLE_STOPWORDS_DE | _TITLE_STOPWORDS_CJK
+
+
+def _extract_title_tokens(text: str) -> set[str]:
+    """提取标题里的核心实词 token（去停用词、连字符当分隔符、unicode 安全）。
+
+    设计：
+      • 用 \\w（unicode）匹配，避免 'änderung' / 'österreich' / 'française' 切错
+      • 连字符 / 斜杠当分隔符——'Elektrokleinstfahrzeuge-Verordnung' 拆成
+        ['elektrokleinstfahrzeuge','verordnung']，让停用词 'verordnung' 能过滤掉
+        （否则整词命中率虚高，BMV 首页偶然提到法规名就被判通过）
+      • 中日韩：双字以上连续字符串当关键词
+    """
+    if not text:
+        return set()
+    low = text.lower()
+    tokens: set[str] = set()
+    # unicode 拉丁实词（数字 + 各国字母，连字符/斜杠/空格当分隔符）
+    for t in re.findall(r"[^\W_]{3,}", low, flags=re.UNICODE):
+        # 排除 CJK（CJK 走下面单独路径，避免拉丁路径误吞）
+        if not re.search(r"[一-鿿぀-ヿ가-힯]", t):
+            if t not in _ALL_TITLE_STOPWORDS:
+                tokens.add(t)
+    # CJK 双字以上词组
+    for chunk in re.findall(r"[一-鿿぀-ヿ가-힯]{2,}", low):
+        if chunk not in _ALL_TITLE_STOPWORDS:
+            tokens.add(chunk)
+    return tokens
+
+
+def _extract_reg_id_signatures(reg_id: str | None) -> list[str]:
+    """返回 reg_id 的多个候选签名——任一在原文里匹配即视为强证据。
+
+    同一法规在不同来源用不同写法很常见，签名要尽量宽容：
+      'eKFV 2026'     → ['ekfv 2026', 'ekfv']
+      'BC-15/18'      → ['bc-15/18', '15/18']
+      '(EU) 2024/2847'→ ['eu 2024/2847', '2024/2847']
+      '32024R2847'    → ['32024r2847', '2024/2847']  ← CELEX 反向
+      'GB 17761-2018' → ['gb 17761-2018', 'gb 17761', '17761']
+    """
+    if not reg_id:
+        return []
+    s = reg_id.strip().lower()
+    s = re.sub(r"[()]", "", s)            # 去括号
+    s = re.sub(r"\s+", " ", s).strip()    # 压缩空白
+    if len(s) < 3:
+        return []
+
+    sigs: list[str] = [s]
+
+    # CELEX 反向（32024R2847 → 2024/2847）
+    m = re.match(r"^3(\d{4})[rldc](\d{1,5})$", s)
+    if m:
+        sigs.append(f"{m.group(1)}/{int(m.group(2))}")
+
+    # 通用 NNNN/NNN 编号格式（EU 风格）
+    for m in re.finditer(r"\b\d{4}/\d{1,5}\b", s):
+        sigs.append(m.group())
+
+    # 缩写词：剥离尾部数字/年份后的纯字母部分（"ekfv 2026" → "ekfv"）
+    m = re.match(r"^([a-z]{3,})\b", s)
+    if m:
+        sigs.append(m.group(1))
+
+    # 标准号尾段：'gb 17761-2018' → '17761'，'bc-15/18' → '15/18'
+    digits = re.findall(r"[\d/\-]{3,}", s)
+    for d in digits:
+        d = d.strip("-/")
+        if len(d) >= 3:
+            sigs.append(d)
+
+    # 去重保序 + 排除纯年份（'2026' 这种 4 位数字在任何页面都常见，无信号价值）
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in sigs:
+        if x and x not in seen and not _is_year_like(x):
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _is_year_like(t: str) -> bool:
+    """4 位数字（1900-2100 范围）= 年份。年份太常见，对相关性判定没意义。"""
+    return t.isdigit() and len(t) == 4 and 1900 <= int(t) <= 2100
+
+
+def _content_matches_title(
+    text: str, title: str | None, reg_id: str | None = None,
+) -> tuple[bool, float, int]:
+    """抓到的内容是否真包含 title/reg_id 的核心 token。
+
+    返回 (是否通过, 命中率, 核心 token 数)。
+
+    判定规则（必要条件）：
+      • 强证据：reg_id 完整签名（'ekfv 2026', 'bc-15/18'）出现在原文 → 直接通过
+      • 弱证据：核心 token 命中率 ≥ 30% AND 绝对命中数 ≥ 2
+        （绝对数门槛防"单个偶然命中"——例：BMV 首页恰好提到 Elektrokleinstfahrzeuge
+         一次就被通过，但 ekfv/sechste 都没出现，说明不是真正文）
+      • token 数 < 2 一律放行（无法判定）
+
+    年份类 token（'2024'/'2026'）会被排除——年份在任何页面都常见，无信号价值。
+    """
+    if not text:
+        return False, 0.0, 0
+    low = text.lower()
+
+    for sig in _extract_reg_id_signatures(reg_id):
+        if sig in low:
+            return True, 1.0, 1
+
+    title_tokens = _extract_title_tokens(title or "")
+    if reg_id:
+        title_tokens |= _extract_title_tokens(reg_id)
+    title_tokens = {t for t in title_tokens if not _is_year_like(t)}
+    if len(title_tokens) < 2:
+        return True, 1.0, len(title_tokens)
+    hits = sum(1 for t in title_tokens if t in low)
+    rate = hits / len(title_tokens)
+    # 绝对命中数门槛：至少 2 个 token 命中（防偶然单词命中通过）
+    return (rate >= _TITLE_HIT_RATE and hits >= 2), rate, len(title_tokens)
+
+
+def _looks_like_placeholder(
+    text: str | None, title: str | None, reg_id: str | None = None,
+) -> str | None:
     """返回失败原因；None 表示通过。"""
     if not text:
         return "无内容"
@@ -91,6 +238,10 @@ def _looks_like_placeholder(text: str | None, title: str | None) -> str | None:
     low = body.lower()
     if n < 1500 and any(m in low for m in _PLACEHOLDER_MARKS):
         return "命中占位页特征"
+    # 第一性必要条件：内容必须包含标题核心 token
+    ok, rate, n_tokens = _content_matches_title(body, title, reg_id)
+    if not ok:
+        return f"内容与标题无关(命中{rate:.0%}/{n_tokens}词)"
     return None
 
 # per-domain 速率控制
@@ -366,6 +517,7 @@ def _try_scrape_chain(row) -> tuple[str | None, str, bool, str | None]:
     """
     main_url = _row_get(row, "source_url")
     title    = _row_get(row, "title")
+    reg_id   = _row_get(row, "reg_id")
 
     candidates: list[str] = []
     if main_url:
@@ -396,7 +548,7 @@ def _try_scrape_chain(row) -> tuple[str | None, str, bool, str | None]:
         # 占位/空壳检测：命中则视为本 candidate 失败，继续下一个；
         # 全部 candidate 都是空壳 → 返回 None → _scrape_one 标 raw='失败'
         # → analyzer/fallback 路径接管，用 grounded 合成（带 ⚠️）
-        reason = _looks_like_placeholder(text, title)
+        reason = _looks_like_placeholder(text, title, reg_id)
         if reason:
             _log.warning("占位页拒收 %s: %s", url, reason)
             continue

@@ -18,6 +18,7 @@ import concurrent.futures
 import json
 import threading
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 import ai_client
 import prompts
@@ -342,6 +343,41 @@ _REG_ID_GARBAGE = {
 }
 
 
+# 首页/索引页文件名——这些 URL 路径形式上"非空"但语义上等于 host-only
+_INDEX_FILE_NAMES = {
+    "index", "index.html", "index.htm", "index.php", "index.aspx",
+    "default", "default.aspx", "default.html",
+    "home", "home.html", "main", "main.html",
+}
+
+
+def _is_concrete_url(url: str | None) -> bool:
+    """URL 必须指向具体内容——host-only 或仅含首页文件名的 URL 抓不到具体法规。
+
+    第一性观察：法规页面 URL 必然有有意义的路径段（reg_id、文件名、唯一 slug）。
+    没有路径 / 路径只是 'home'/'default.aspx' 类首页 → 抓回的是首页全文，
+    AI 会拿首页 + 标题凭空发挥。
+    """
+    if not url:
+        return False
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if p.scheme not in ("http", "https"):
+        return False
+    path = (p.path or "").strip("/")
+    if not path:
+        return False
+    segments = [s for s in path.split("/") if s]
+    if len(segments) == 0:
+        return False
+    # 仅有 1 段且是已知首页文件名 → 等同于 host-only
+    if len(segments) == 1 and segments[0].lower() in _INDEX_FILE_NAMES:
+        return False
+    return True
+
+
 def _clean_reg_id(raw: str) -> str | None:
     """清洗模型自报的 reg_id；只过滤垃圾值，不做语义规范化。"""
     if not raw:
@@ -385,19 +421,33 @@ def _store(reg: dict, sources: list[dict]) -> bool:
                 s["url"] for s in sources
                 if s.get("url") and "vertexaisearch" not in s["url"]
             ]
-            seen      = {explicit_url} if explicit_url else set()
-            fallbacks: list[str] = []
+
+            # 候选池 = explicit_url + grounding 来源（去重保序）
+            seen: set[str] = set()
+            all_candidates: list[str] = []
+            if explicit_url:
+                seen.add(explicit_url)
+                all_candidates.append(explicit_url)
             for u in grounding_urls:
                 if u and u not in seen:
                     seen.add(u)
-                    fallbacks.append(u)
-            if explicit_url:
-                rep_url = explicit_url
-            elif fallbacks:
-                rep_url   = fallbacks[0]
-                fallbacks = fallbacks[1:]
+                    all_candidates.append(u)
+
+            # URL 质量门：优先选指向具体内容的 URL，host-only / 首页文件名降级
+            # 例：AI 给的 explicit_url='https://www.bmdv.bund.de/'（host-only），
+            # 但 grounding 里有 https://www.bmdv.bund.de/SharedDocs/Pressemit/...html
+            # → 后者优先；这样 scraper 抓到的就是具体页面而不是首页全文。
+            concrete = [u for u in all_candidates if _is_concrete_url(u)]
+            if concrete:
+                rep_url   = concrete[0]
+                fallbacks = [u for u in all_candidates if u != rep_url]
+            elif all_candidates:
+                # 全是 host-only：留主 URL 但下游 scraper 大概率拒收 → fallback 接管
+                rep_url   = all_candidates[0]
+                fallbacks = all_candidates[1:]
             else:
                 rep_url = ""
+                fallbacks = []
             fallback_json = json.dumps(fallbacks[:5], ensure_ascii=False) if fallbacks else None
 
             market_hint = (reg.get("market_hint") or "").strip()

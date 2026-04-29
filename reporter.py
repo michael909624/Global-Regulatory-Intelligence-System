@@ -18,6 +18,9 @@ import authority
 from config import REPORTS_DIR
 from database import init_db, get_all_analyses, get_week_analyses, get_manual_followup
 
+# 与 analyzer/_shared.SYNTHESIS_WARNING 保持一致——避免循环依赖直接复制字符串
+_SYNTHESIS_WARNING = "⚠️ 原文抓取失败，此条目基于 AI 合成，请人工核实后再使用。"
+
 # Excel 单元格字符上限（openpyxl 保护性裁剪）
 _EXCEL_CELL_MAX = 32_000
 
@@ -258,6 +261,10 @@ def _fill_sheet(ws, rows) -> None:
         sources_json       = row["sources"] or ""
         source_institution = row["source_institution"]
         source_language    = row["source_language"]
+        try:
+            is_synth = bool(row["is_synth"])
+        except (IndexError, KeyError):
+            is_synth = False
 
         parity = group_parity.get(impact, 0)
         is_new = impact != prev_impact
@@ -292,6 +299,11 @@ def _fill_sheet(ws, rows) -> None:
             src_url = authority.best_url(candidates) or src_url
 
         biz_block = (business_impact or worst_case).strip()
+        # 兜底：合成条目的 ⚠️ 标识必须出现在用户可见位置
+        # （fallback 路径会写入 business_impact 头部，但若历史数据 / AI 偶发返回空 biz
+        #  导致警告丢失，这里基于 sc.full_text 的事实信号补救）
+        if is_synth and "AI 合成" not in biz_block:
+            biz_block = f"{_SYNTHESIS_WARNING}\n{biz_block}".strip()
 
         ws.append([_clean(v) for v in [
             _BADGE_TEXT.get(impact, impact),

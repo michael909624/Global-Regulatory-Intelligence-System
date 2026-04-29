@@ -59,19 +59,36 @@ def _analyze_one(idx: int, total: int, sc_row) -> str:
         safe_print(f"  [{idx:>3}/{total}] {title[:52]} ✗ 内容为空，跳过")
         return "fail"
 
-    h      = reg_hash(title)
-    cutoff = (datetime.now() - timedelta(days=30)).isoformat()
-    with get_connection() as conn:
-        if conn.execute(
-            "SELECT 1 FROM compliance_analysis WHERE content_hash=? AND analysis_date>=?",
-            (h, cutoff),
-        ).fetchone():
-            mark_analyzed(sc_row["id"])
-            safe_print(f"  [{idx:>3}/{total}] {title[:52]} → 重复，跳过")
-            return "dup"
-
-    # 上一轮 fallback 留下的合成内容若被重置 ai_analyzed=0 → 走降级 prompt
+    h        = reg_hash(title)
+    cutoff   = (datetime.now() - timedelta(days=30)).isoformat()
     is_synth = full_text.startswith("[Gemini synthesis]")
+    # 30 天去重：同一 title 已分析过则跳过。
+    # 例外：旧记录是合成版（[Gemini synthesis]）但本次是真原文 → 删旧让原文替换。
+    # 否则真原文永远抢不过早一秒入库的合成版（用户想看权威原文反而看不到）。
+    with get_connection() as conn:
+        existing = conn.execute("""
+            SELECT ca.id AS ca_id,
+                   sc.full_text AS old_text
+            FROM compliance_analysis ca
+            JOIN scraped_content sc ON sc.id = ca.scraped_id
+            WHERE ca.content_hash=? AND ca.analysis_date>=?
+            ORDER BY ca.id DESC
+            LIMIT 1
+        """, (h, cutoff)).fetchone()
+        if existing:
+            old_is_synth = (existing["old_text"] or "").startswith("[Gemini synthesis]")
+            if old_is_synth and not is_synth:
+                conn.execute(
+                    "DELETE FROM compliance_analysis WHERE id=?",
+                    (existing["ca_id"],),
+                )
+                _log.info("REPLACE synth→raw scraped_id=%d ca=%d title=%s",
+                          sc_row["id"], existing["ca_id"], title[:40])
+                safe_print(f"  [{idx:>3}/{total}] {title[:52]} ↻ 原文替换旧合成版")
+            else:
+                mark_analyzed(sc_row["id"])
+                safe_print(f"  [{idx:>3}/{total}] {title[:52]} → 重复，跳过")
+                return "dup"
     if is_synth:
         tmpl, sys_prompt, extra_biz = FALLBACK_PROMPT_TMPL, FALLBACK_SYSTEM, SYNTHESIS_WARNING
     else:

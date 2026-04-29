@@ -435,7 +435,8 @@ _REPORT_SELECT = """
         ca.sources,
         ca.analysis_date,
         ca.source_institution,
-        ca.source_language
+        ca.source_language,
+        CASE WHEN sc.full_text LIKE '[Gemini synthesis]%' THEN 1 ELSE 0 END AS is_synth
     FROM compliance_analysis ca
     JOIN scraped_content      sc ON sc.id = ca.scraped_id
     JOIN raw_search_results   rs ON rs.id = sc.raw_id
