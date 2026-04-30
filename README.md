@@ -229,6 +229,12 @@ python gris.py                # 显示完整命令帮助
 - 🟡 **中影响** — 需要评估、可能需要适配
 - 🟢 **低影响** — 仅需了解,无紧急动作
 
+另外可能在"业务影响"列开头看到:
+
+- ⚠️ **AI 合成分析** — 表示原文抓取失败(网站拦截 / JS 渲染壳 / 占位页等),
+  分析内容是 AI 基于法规标题 + 公开背景知识合成的兜底版本,**不等同于原文**,
+  关键决策请回到来源链接核对原文。
+
 ## 常见问题
 
 ### 方案 A 相关
@@ -277,19 +283,32 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 ```
 gris/
-├── gris.py              # 主入口
-├── researcher.py        # 第 1 步:Gemini 搜索发现
-├── scraper.py           # 第 2 步:抓取网页/PDF
-├── analyzer.py          # 第 3 步:AI 合规分析
-├── reporter.py          # 第 4 步:生成 Excel
+├── gris.py              # 主入口(命令分发)
+├── researcher.py        # 第 1 步:Gemini 搜索发现 + URL 质量门
+├── scraper.py           # 第 2 步:抓网页/PDF + 占位页/空壳页拒收
+├── analyzer/            # 第 3 步:AI 合规分析(已拆包)
+│   ├── main.py          #   主分析流程 + 30 天去重(原文优先)
+│   ├── fallback.py      #   抓取失败时的 grounded 合成兜底
+│   ├── consolidation.py #   多条同法规合并(2-Pass + 矛盾拒收)
+│   ├── values.py        #   字段标准化
+│   ├── backfill.py      #   历史数据回填
+│   └── _shared.py       #   公共工具
+├── consolidator.py      # 全局二次去重(含 LLM 语义聚类残余兜底)
+├── reporter.py          # 第 4 步:生成 Excel + ⚠️ 合成警告兜底显示
 ├── classify.py          # 影响等级分类
-├── database.py          # SQLite 数据库
+├── authority.py         # 监管机构权威度评分
+├── evaluate.py          # 评估/调试工具
+├── ai_client.py         # Gemini 客户端封装
+├── seeds.py             # 启动时的种子法规库
+├── database.py          # SQLite 数据库 schema + 查询
 ├── manual_input.py      # 抓取失败时人工补录
 ├── utils.py             # 通用工具
 ├── config.py            # 公共配置
 ├── config_local.py      # 你的 API key(自建,不要分享)
 ├── requirements.txt     # Python 依赖
-├── .github/workflows/   # GitHub Actions 配置
+├── prompts/             # 所有 LLM prompts(独立文件,便于改写)
+├── tests/               # 单元测试
+├── .github/workflows/   # GitHub Actions 配置(run.yml)
 ├── data/                # 数据库
 ├── logs/                # 日志
 └── reports/             # Excel 输出
