@@ -87,9 +87,19 @@ _PRODUCT_ALIAS: dict[str, str] = {
 _ALIAS_LOWER = {alias.lower(): canonical for alias, canonical in _PRODUCT_ALIAS.items()}
 
 
-def normalize_products(raw: str) -> str:
-    """规范化 affected_products 字符串到「、」分隔的标准整机名。"""
-    if not raw:
+def normalize_products(raw) -> str:
+    """规范化 affected_products 到「、」分隔的标准整机名。
+
+    LLM 偶尔会把 string 字段返回成 list（多产品时）或 None。这里统一兜底，
+    防止 re.split 收到 list 时抛 TypeError 让整条分析悄悄丢失。
+    """
+    if raw is None:
+        return "不相关"
+    if isinstance(raw, list):
+        raw = "、".join(str(x).strip() for x in raw if x is not None and str(x).strip())
+    elif not isinstance(raw, str):
+        raw = str(raw)
+    if not raw.strip():
         return "不相关"
     parts = [p.strip() for p in re.split(r"[、,，/]", raw) if p.strip()]
     matched: list[str] = []

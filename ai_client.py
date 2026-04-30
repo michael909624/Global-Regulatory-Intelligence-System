@@ -204,6 +204,32 @@ def _do_call_with_retry(
     raise RuntimeError(f"{label} failed after {retries + 1} attempts: {last_err}")
 
 
+class BlockedResponseError(RuntimeError):
+    """模型返回空响应且 finish_reason 非 STOP（SAFETY / RECITATION / MAX_TOKENS 等）。
+    与"模型说了空字符串"区分开——前者是被屏蔽，调用方应当 fail-loud 而非静默入库。
+    """
+
+
+def _check_finish_reason(resp, label: str) -> None:
+    """resp.text 为空时检查 finish_reason；非 STOP 则视为被屏蔽，抛错。
+    SDK 在 SAFETY/RECITATION/MAX_TOKENS 时 text 都是 None——不区分会让被屏蔽的法规
+    悄悄变成"信息不足→🟢"入库，污染合规情报。
+    """
+    fr_str = ""
+    try:
+        fr = resp.candidates[0].finish_reason
+        fr_str = str(fr) if fr is not None else ""
+    except (IndexError, AttributeError):
+        return
+    if not fr_str:
+        return
+    # FinishReason 在不同 SDK 版本里可能是 enum 或字符串；统一按结尾匹配 "STOP"
+    if fr_str.endswith("STOP") or fr_str.endswith("FINISH_REASON_STOP"):
+        return
+    _log.warning("%s blocked: finish_reason=%s", label, fr_str)
+    raise BlockedResponseError(f"{label} blocked: finish_reason={fr_str}")
+
+
 # ── 公共 API ──────────────────────────────────────────────────────────────────
 
 def call_grounded(
@@ -237,6 +263,8 @@ def call_grounded(
     )
 
     text = resp.text or ""
+    if not text:
+        _check_finish_reason(resp, "call_grounded")
     sources: list[dict] = []
     try:
         meta = resp.candidates[0].grounding_metadata
@@ -277,4 +305,7 @@ def call_json(
     resp = _do_call_with_retry(
         label="call_json", model=model, prompt=prompt, cfg=cfg, retries=retries,
     )
-    return resp.text or ""
+    text = resp.text or ""
+    if not text:
+        _check_finish_reason(resp, "call_json")
+    return text

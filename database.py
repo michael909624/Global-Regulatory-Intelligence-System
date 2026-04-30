@@ -444,6 +444,18 @@ _REPORT_SELECT = """
       AND COALESCE(ca.affected_products_display, ca.affected_products) IS NOT NULL
       AND COALESCE(ca.affected_products_display, ca.affected_products) != ''
       AND rs.consolidated_into IS NULL
+      -- 低置信过滤：LLM 自报"零业务维度 + 🟢 影响"= 它自己都不确定，
+      -- 通常是被标题关键词诱导后的"合理推断"猜测。这种条目对用户是噪音，
+      -- 让真正高置信的（≥1 维度 OR ≥🟡 影响）才进周报。
+      -- 设计前提：真业务相关法规至少能识别出一个 L3 维度，否则就是误判。
+      AND NOT (
+          ca.impact_level = '🟢'
+          AND (
+              ca.business_dimensions IS NULL
+              OR TRIM(ca.business_dimensions) = ''
+              OR ca.business_dimensions = '[]'
+          )
+      )
 """
 
 _REPORT_ORDER = """

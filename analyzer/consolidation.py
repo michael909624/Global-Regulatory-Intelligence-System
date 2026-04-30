@@ -77,7 +77,10 @@ def _is_contradictory(reason: str | None) -> bool:
 _CONSOLIDATION_QUERY = """
     SELECT ca.id, rs.title, rs.source_url, rs.reg_id, ca.affected_markets,
            ca.impact_level, ca.affected_products, ca.business_dimensions,
-           sc.full_text, ca.compliance_requirement
+           sc.full_text, ca.compliance_requirement,
+           ca.key_dates, ca.worst_case_scenario, ca.business_impact,
+           ca.source_institution, ca.source_language, ca.sources,
+           ca.compliance_deadline
     FROM compliance_analysis ca
     JOIN scraped_content sc ON sc.id = ca.scraped_id
     JOIN raw_search_results rs ON rs.id = sc.raw_id
@@ -93,6 +96,116 @@ def _merge_markets(markets_list: list[str]) -> str:
             if part not in seen:
                 seen.append(part)
     return "、".join(seen)
+
+
+def _row_get(row, key: str, default=None):
+    """安全读 sqlite3.Row 字段（缺列时返回 default）。"""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
+
+
+def _merge_dimensions(rows) -> str:
+    """合并多条记录的 business_dimensions JSON 数组（去重保序）。"""
+    seen: list[str] = []
+    for r in rows:
+        try:
+            arr = json.loads(_row_get(r, "business_dimensions") or "[]")
+        except Exception:
+            arr = []
+        if not isinstance(arr, list):
+            continue
+        for d in arr:
+            if isinstance(d, str) and d not in seen:
+                seen.append(d)
+    return json.dumps(seen, ensure_ascii=False)
+
+
+def _merge_key_dates(rows) -> str:
+    """合并多条记录的 key_dates JSON：
+       publish/effective/consultation_close 取首条非空；
+       enforcements 按 (date, scope) 去重并集——不同子条款各自的强制日全保留。
+    """
+    publish = effective = consultation = None
+    enforcements: list = []
+    seen_enf: set = set()
+    for r in rows:
+        try:
+            kd = json.loads(_row_get(r, "key_dates") or "{}")
+        except Exception:
+            kd = {}
+        if not isinstance(kd, dict):
+            continue
+        if not publish and kd.get("publish"):
+            publish = kd["publish"]
+        if not effective and kd.get("effective"):
+            effective = kd["effective"]
+        if not consultation and kd.get("consultation_close"):
+            consultation = kd["consultation_close"]
+        for e in (kd.get("enforcements") or []):
+            if not isinstance(e, dict):
+                continue
+            sig = ((e.get("date") or "").strip(), (e.get("scope") or "").strip())
+            if any(sig) and sig not in seen_enf:
+                seen_enf.add(sig)
+                enforcements.append(e)
+    return json.dumps({
+        "publish":            publish,
+        "effective":          effective,
+        "enforcements":       enforcements,
+        "consultation_close": consultation,
+    }, ensure_ascii=False)
+
+
+def _merge_sources(rows) -> str | None:
+    """合并所有 sources JSON 数组（按 url 去重，保序）。返回 None 表示无变化。"""
+    keeper_sources_raw = _row_get(rows[0], "sources")
+    try:
+        merged: list = json.loads(keeper_sources_raw or "[]")
+    except Exception:
+        merged = []
+    if not isinstance(merged, list):
+        merged = []
+    seen_urls = {s["url"] for s in merged if isinstance(s, dict) and s.get("url")}
+    changed = False
+    for r in rows[1:]:
+        try:
+            other = json.loads(_row_get(r, "sources") or "[]")
+        except Exception:
+            other = []
+        if not isinstance(other, list):
+            continue
+        for s in other:
+            if isinstance(s, dict) and s.get("url") and s["url"] not in seen_urls:
+                seen_urls.add(s["url"])
+                merged.append(s)
+                changed = True
+    if not changed:
+        return None
+    return json.dumps(merged, ensure_ascii=False)
+
+
+def _backfill_keeper_text_fields(keeper, to_del) -> dict:
+    """keeper 缺失而被删条目里有的文本字段，回补到 keeper（保留先发现非空值）。"""
+    patch: dict = {}
+    for col in (
+        "compliance_requirement", "worst_case_scenario", "business_impact",
+        "source_institution", "source_language", "compliance_deadline",
+    ):
+        cur = (_row_get(keeper, col) or "")
+        if isinstance(cur, str):
+            cur = cur.strip()
+        if cur:
+            continue
+        for r in to_del:
+            v = _row_get(r, col)
+            if isinstance(v, str):
+                v = v.strip()
+            if v:
+                patch[col] = v
+                break
+    return patch
 
 
 def _row_signature(r) -> str | None:
@@ -145,21 +258,43 @@ def _dedup_by_reg_signature(rows: list) -> tuple[int, int]:
         to_del  = group[1:]
         keep_id = keep["id"]
 
+        # 合并需要"并集"语义的字段——丢任何一个被删条目独有的信号
+        # 都意味着报告里某条同 reg_id 法规的 dim/强制日/sources 永久消失。
         merged_market = _merge_markets([r["affected_markets"] or "" for r in group])
+        merged_dims   = _merge_dimensions(group)
+        merged_dates  = _merge_key_dates(group)
+        merged_srcs   = _merge_sources(group)
+        backfill_patch = _backfill_keeper_text_fields(keep, to_del)
+
         del_ids = [r["id"] for r in to_del]
 
+        update_cols: list[str] = [
+            "affected_markets=?", "business_dimensions=?", "key_dates=?",
+        ]
+        update_vals: list = [merged_market, merged_dims, merged_dates]
+        if merged_srcs is not None:
+            update_cols.append("sources=?")
+            update_vals.append(merged_srcs)
+        for col, val in backfill_patch.items():
+            update_cols.append(f"{col}=?")
+            update_vals.append(val)
+        update_vals.append(keep_id)
+        update_sql = (
+            f"UPDATE compliance_analysis SET {', '.join(update_cols)} WHERE id=?"
+        )
+
         with get_connection() as conn:
-            conn.execute(
-                "UPDATE compliance_analysis SET affected_markets=? WHERE id=?",
-                (merged_market, keep_id),
-            )
+            conn.execute(update_sql, update_vals)
             for did in del_ids:
                 conn.execute("DELETE FROM compliance_analysis WHERE id=?", (did,))
                 deleted_entries += 1
 
         merged_groups += 1
         titles = " / ".join((r["title"] or "")[:35] for r in group)
-        _log.info("REGID-DEDUP key=%s keep=%d deleted=%s", key, keep_id, del_ids)
+        _log.info(
+            "REGID-DEDUP key=%s keep=%d deleted=%s backfilled=%s",
+            key, keep_id, del_ids, sorted(backfill_patch.keys()),
+        )
         print(f"  ✓ reg_id去重 [{key}]：保留 ID={keep_id}，删除 {del_ids}  [{titles[:80]}]")
 
     return merged_groups, deleted_entries
