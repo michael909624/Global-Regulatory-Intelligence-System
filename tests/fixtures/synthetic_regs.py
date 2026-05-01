@@ -47,7 +47,7 @@ class SyntheticReg:
     should_appear_in_report: bool = True
     expected_products: list[str] = field(default_factory=list)   # 5 类整机标准名
     expected_dimensions: list[str] = field(default_factory=list) # 八维 L3
-    expected_impact: str = "🟡"                                  # 🔴/🟡/🟢
+    expected_impact: str = "🟡"                                  # 🔴 / 🟡(🟢 已废弃)
     expected_markets: str = ""
 
     # 故意制造的"陷阱"标记（用于 LLM 模拟器注入噪声）
@@ -489,7 +489,7 @@ POSITIVE_CASES: list[SyntheticReg] = [
         expected_markets="澳大利亚",
     ),
 
-    # ── 草案 / 早期阶段（应是 🟡 或 🟢）──
+    # ── 草案 / 早期阶段（统一 🟡;旧三档时代会标 🟢,现已废弃）──
     SyntheticReg(
         id="P22_eu_dpp_consultation",
         title="EU Digital Product Passport — Public Consultation Q3 2026",
@@ -526,7 +526,7 @@ POSITIVE_CASES: list[SyntheticReg] = [
         ),
         expected_products=["电助力自行车"],
         expected_dimensions=["USE"],
-        expected_impact="🟡",  # 阶段 2 + C1 → 🟢，但跨州 + 知名议题 → 🟡
+        expected_impact="🟡",  # 跨州 + 知名议题 → 🟡(旧三档下会犹豫到 🟢,现统一 🟡)
         expected_markets="美国（加州）",
     ),
     SyntheticReg(
@@ -934,7 +934,7 @@ EDGE_CASES: list[SyntheticReg] = [
         trap_kind="list_products",
     ),
 
-    # SAFETY 屏蔽（应抛 BlockedResponseError，不静默 🟢）
+    # SAFETY 屏蔽（应抛 BlockedResponseError,不静默成低置信猜测入库）
     SyntheticReg(
         id="E08_safety_blocked",
         title="China Export Control on Dual-Use Lithium Battery Tech",

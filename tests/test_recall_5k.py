@@ -85,8 +85,8 @@ def _result_irrelevant() -> dict:
         "dates":               {"publish": None, "effective": None,
                                 "enforcements": [], "consultation_close": None},
         "deadline":            None,
-        "importance":          "🟢",
-        "importance_note":     "阶段?（不相关）+ C? → 🟢",
+        "importance":          "🟡",   # 'affected_products=不相关' 会先被 SQL 过滤,impact 不影响
+        "importance_note":     "阶段?（不相关）",
         "worst_case":          "—",
         "business_impact":     "—",
         "business_dimensions": [],
@@ -150,9 +150,10 @@ def _patched_call_json(prompt: str, *, system: str = "", **kwargs) -> str:
 def _result_for_should_appear_fake(c: PoolReg) -> dict:
     """LLM 错把 OUT_OF_WINDOW / DISTRACTOR / IRRELEVANT 当相关时的猜测输出。
 
-    真实 Gemini 行为：被关键词诱导后会给出"信息不足 + 🟢"的低置信结果，
-    business_dimensions 通常留空（不知道就不填），impact 偏 🟢，
+    真实 Gemini 行为:被关键词诱导后会给出"信息不足 + 🟡"的低置信结果,
+    business_dimensions 通常留空(不知道就不填),impact 偏 🟡,
     importance_note 含"信息不足/合理推断"等自我标注。这些都是过滤可用信号。
+    新两档制度下"🟡 + 零 dim → drop"取代旧"🟢 + 零 dim → drop"过滤逻辑。
     """
     return {
         "requirement":         "1. 推断要求（信息不足）",
@@ -163,8 +164,8 @@ def _result_for_should_appear_fake(c: PoolReg) -> dict:
             "consultation_close": None,
         },
         "deadline":            None,
-        "importance":          "🟢",
-        "importance_note":     "阶段?（信息不足）+ C? → 🟢 ｜ 合理推断",
+        "importance":          "🟡",   # 低置信仍记 🟡(🟢 已废弃),靠 dim=[] 信号过滤
+        "importance_note":     "阶段?（信息不足）｜ 合理推断",
         "worst_case":          "—",
         "business_impact":     "推断关联（标题含相关关键词，合规性待复核）",
         "business_dimensions": [],   # ← 真实 LLM 不确定时倾向留空

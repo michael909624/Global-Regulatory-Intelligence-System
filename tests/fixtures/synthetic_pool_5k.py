@@ -44,8 +44,14 @@ class PoolReg:
     label: LabelKind          # 标准答案
     expected_products: list[str] = field(default_factory=list)
     expected_dimensions: list[str] = field(default_factory=list)
-    expected_impact: str = "🟢"
+    expected_impact: str = "🟡"   # 默认值用 🟡(🟢 已废弃,见 commit 1ed7b32 两档化)
     expected_markets: str = ""
+
+    # 模拟 scraper 阶段的产出（20K 池子用，5K 池子默认 "ok"）：
+    #   "ok"        → 正常写入 sc (full_text 长且对题)
+    #   "fail"      → scrape_status='失败' 不写 sc，等 fallback 处理
+    #   "mismatch"  → 写入 sc 但 full_text 是无关短段落（导航页 / 错页）
+    scrape_outcome: str = "ok"
 
     @property
     def should_appear_in_report(self) -> bool:
@@ -105,12 +111,13 @@ _RELEVANT_TEMPLATES = [
      ["USE", "RETAIL"], "single", "🟡"),
     ("{market_en} Data Protection Compliance for {prod_en} Telematics",
      ["RD"], "single", "🟡"),
-    # —— 边界 case：真 🟢（早期咨询 / 低紧迫但属业务范围）——
-    # 验证 reporter 低置信过滤"🟢 AND dims=[]" 不会误伤"🟢 + dims 非空"的真相关条目
+    # —— 边界 case:低紧迫真相关(早期咨询 / 长期路线图,属业务范围)——
+    # 验证 reporter 低置信过滤"🟡 AND dims=[]" 不会误伤"🟡 + dims 非空"的真相关条目
+    # (commit 1ed7b32 两档化前用 🟢 标这类边界,现在统一 🟡)
     ("{market_en} Public Consultation: {prod_en} Noise Limit Discussion Paper",
-     ["RD"], "single", "🟢"),
+     ["RD"], "single", "🟡"),
     ("{market_en} Long-Term Roadmap Discussion: Future {prod_en} Standards",
-     ["RD", "CERT"], "single", "🟢"),
+     ["RD", "CERT"], "single", "🟡"),
 ]
 
 
@@ -346,7 +353,7 @@ def _gen_out_window_relevant(n: int, rng: random.Random, today: datetime) -> lis
             label="OUT_OF_WINDOW",
             expected_products=_pick_products(rng, prod_kind),
             expected_dimensions=[],
-            expected_impact="🟢",
+            expected_impact="🟡",   # OUT_OF_WINDOW 应被时间窗过滤,impact 取值不重要
             expected_markets="",
         ))
     return out
@@ -388,7 +395,7 @@ def _gen_distractors(n: int, rng: random.Random, today: datetime) -> list[PoolRe
             label="DISTRACTOR",
             expected_products=[],   # LLM 应判"不相关"
             expected_dimensions=[],
-            expected_impact="🟢",
+            expected_impact="🟡",   # DISTRACTOR 应被"不相关"过滤,impact 取值不重要
             expected_markets="",
         ))
     return out
@@ -424,7 +431,7 @@ def _gen_irrelevant(n: int, rng: random.Random, today: datetime) -> list[PoolReg
             label="IRRELEVANT",
             expected_products=[],
             expected_dimensions=[],
-            expected_impact="🟢",
+            expected_impact="🟡",   # IRRELEVANT 应被"不相关"过滤,impact 取值不重要
             expected_markets="",
         ))
     return out

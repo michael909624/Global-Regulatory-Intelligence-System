@@ -81,8 +81,8 @@ def _fake_llm_for_analyzer(prompt: str, case: SyntheticReg) -> dict:
             "dates":               {"publish": None, "effective": None,
                                     "enforcements": [], "consultation_close": None},
             "deadline":            None,
-            "importance":          "🟢",
-            "importance_note":     "阶段?（不相关）+ C? → 🟢",
+            "importance":          "🟡",   # 'affected_products=不相关' 先 SQL 过滤,impact 不影响
+            "importance_note":     "阶段?（不相关）",
             "worst_case":          "—",
             "business_impact":     "—",
             "business_dimensions": [],
@@ -152,7 +152,7 @@ def _patched_call_json(prompt: str, *, system: str = "", **kwargs) -> str:
                     return json.dumps(_fake_llm_for_analyzer(prompt, case), ensure_ascii=False)
         # 找不到 case：返回 "不相关"
         return json.dumps({
-            "importance": "🟢", "affected_products": "不相关",
+            "importance": "🟡", "affected_products": "不相关",
             "business_dimensions": [], "requirement": "未知",
             "deadline": None, "worst_case": "—", "business_impact": "—",
             "affected_markets": "", "importance_note": "未知",
