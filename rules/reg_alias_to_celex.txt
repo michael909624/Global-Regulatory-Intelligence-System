@@ -1,0 +1,16 @@
+# 法规俗称 / 别名 → CELEX 编号
+# 用途:让"CRA"和"Reg 2024/2847"被识别为同一份法规并合并到一起。
+# 格式:<左侧正则> => <右侧 CELEX 编号>
+# CELEX 编号格式:EU/<年份>/<法规号>(系统内部规范化键)
+
+# 网络韧性法案
+\bCRA\b|CYBER\s+RESILIENCE\s+ACT => EU/2024/2847
+
+# AI 法案
+\bAI\s+ACT\b|ARTIFICIAL\s+INTELLIGENCE\s+ACT => EU/2024/1689
+
+# 电池法规(欧盟新版)
+\bBATTERY\s+REGULATION\b|BATTERIES\s+REGULATION => EU/2023/1542
+
+# 机械法规
+MACHINERY\s+REGULATION => EU/2023/1230

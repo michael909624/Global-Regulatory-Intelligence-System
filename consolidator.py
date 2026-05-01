@@ -24,6 +24,7 @@ from collections import defaultdict
 import ai_client
 import authority
 import prompts
+import rules
 from database import get_connection
 from utils import get_logger, parse_json_array
 
@@ -52,13 +53,8 @@ _TITLE_STOPWORDS = {
 # 选 keeper 会让真法规被合并到无关 keeper → 主分析按无关 title 判不相关 → 漏召回。
 #
 # 加这一层"非法规 title"识别，让 keeper 选择优先合规相关的成员。
-_NAVIGATION_TITLE_PATTERNS = [
-    "press release", "site map", "sitemap", "glossary", "table of contents",
-    "about us", "contact us", "cookie policy", "privacy policy",
-    "homepage", "home page", "search results", "page not found",
-    "annual report", "media inquiries", "communications portal",
-    "新闻发布", "网站地图", "术语表", "关于我们", "联系我们", "首页", "搜索结果",
-]
+# 关键词外移到 rules/navigation_titles.txt——业务同事可直接编辑加新词。
+_NAVIGATION_TITLE_PATTERNS = rules.load_lines("navigation_titles")
 
 
 def _is_navigation_title(title: str | None) -> bool:
@@ -84,28 +80,14 @@ def _is_navigation_title(title: str | None) -> bool:
 # 保守原则：只折叠"明确同一编号的不同写法"。"CRA" 与 "EU/2024/2847"
 # 在 Stage 0 视作不同组（两者通过 ALIAS/EU 路径独立归一） —— 跨家族合并交给 Stage 3。
 
-_ALIAS_MAP = {
-    r"\bPSTI\b|PRODUCT\s+SECURITY\s+(?:&|AND)\s+TELECOM": "PSTI",
-    r"\bRO?HS\b":                                 "ROHS",
-    r"\bREACH\b":                                 "REACH",
-    r"\bGDPR\b":                                  "GDPR",
-    # 危险品运输标准——版本号差异不视作独立法规
-    r"\bIATA\b(?:\s+DGR|\s+DANGEROUS\s+GOODS)?":  "IATA_DGR",
-    r"\bIMDG\b":                                  "IMDG_CODE",
-    r"\bADR\b(?:[/\s]+RID)?":                     "ADR",
-    r"\bDOT\b\s*(?:HMR|49\s*CFR)":                "US_HMR",
-    r"\bPHMSA\b":                                 "US_HMR",
-}
+# 别名映射(PSTI / RoHS / REACH / IATA / 危险品运输 ...)外移到 rules/reg_aliases.txt
+_ALIAS_MAP = rules.load_pairs("reg_aliases")
 
 # ALIAS → CELEX 反向映射：让别名条目（"CRA"、"AI Act"、"Battery Regulation"）
 # 和 CELEX 条目（EU/2024/2847）落到同一聚类 key，根治"同一法规 5 个 reg_id"
 # 漏合并问题。优先级高于 _ALIAS_MAP（在 normalize_reg_id 里先匹配）。
-_ALIAS_TO_CELEX = {
-    r"\bCRA\b|CYBER\s+RESILIENCE\s+ACT":          "EU/2024/2847",
-    r"\bAI\s+ACT\b|ARTIFICIAL\s+INTELLIGENCE\s+ACT": "EU/2024/1689",
-    r"\bBATTERY\s+REGULATION\b|BATTERIES\s+REGULATION": "EU/2023/1542",
-    r"MACHINERY\s+REGULATION":                    "EU/2023/1230",
-}
+# 法规清单外移到 rules/reg_alias_to_celex.txt——业务同事可直接加新法规。
+_ALIAS_TO_CELEX = rules.load_pairs("reg_alias_to_celex")
 
 _STD_PREFIXES = ("EN", "IEC", "UL", "ISO", "JIS", "AS/NZS", "AIS", "ANSI", "CSA", "BS")
 
@@ -146,7 +128,7 @@ def normalize_reg_id(raw: str | None) -> str | None:
         return f"EU/{m.group(1)}/{int(m.group(2))}"
 
     # 别名优先映射到对应 CELEX（让 "CRA" / "AI Act" 等条目和 CELEX 条目同组）
-    for pat, celex_key in _ALIAS_TO_CELEX.items():
+    for pat, celex_key in _ALIAS_TO_CELEX:
         if re.search(pat, upper):
             return celex_key
 
@@ -180,7 +162,7 @@ def normalize_reg_id(raw: str | None) -> str | None:
             return f"{key_prefix}/{m.group(1)}"
 
     # 别名（CRA / AI Act / Battery Regulation / PSTI / RoHS / REACH / GDPR）
-    for pat, alias in _ALIAS_MAP.items():
+    for pat, alias in _ALIAS_MAP:
         if re.search(pat, upper):
             return f"ALIAS/{alias}"
 

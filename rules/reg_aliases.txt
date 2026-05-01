@@ -1,0 +1,24 @@
+# 法规别名 → 内部归一键
+# 用途:Stage 0 聚类时,同一类别名(如多种 RoHS 写法)会被合并为同一组。
+# 格式:<左侧正则> => <右侧归一名>
+# 提示:左侧的标题在匹配前已被系统转成大写,所以可以全部写大写关键词。
+#       \b 表示单词边界(防止 "ROHS" 被 "PYROHSANDLE" 误命中)。
+
+# 联网产品安全(英国 PSTI)
+\bPSTI\b|PRODUCT\s+SECURITY\s+(?:&|AND)\s+TELECOM => PSTI
+
+# 物质限制三件套
+\bRO?HS\b => ROHS
+\bREACH\b => REACH
+
+# 数据隐私(GRIS 通常不直接监控,但同名归一以便后续筛除)
+\bGDPR\b => GDPR
+
+# 危险品运输标准(锂电池属第 9 类,这些标准直接相关)
+\bIATA\b(?:\s+DGR|\s+DANGEROUS\s+GOODS)? => IATA_DGR
+\bIMDG\b => IMDG_CODE
+\bADR\b(?:[/\s]+RID)? => ADR
+
+# 美国危险品运输(DOT HMR / PHMSA 是同一套规则的两个常用提法)
+\bDOT\b\s*(?:HMR|49\s*CFR) => US_HMR
+\bPHMSA\b => US_HMR

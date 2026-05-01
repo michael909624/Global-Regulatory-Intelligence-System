@@ -1,0 +1,32 @@
+# 导航页 / 无义务页面关键词(小写后子串匹配)
+# 用途:Stage 0 聚类合并时,如果成员里有"高权威域名 + 无关 title"的条目
+#       (如 eur-lex 域下挂的 Press Release / Site Map / Glossary),
+#       这些条目不会抢占 keeper 位,让真法规优先被保留。
+# 格式:每行一个关键词。匹配方式:title.lower() 包含此子串即命中。
+
+# 英文常见
+press release
+site map
+sitemap
+glossary
+table of contents
+about us
+contact us
+cookie policy
+privacy policy
+homepage
+home page
+search results
+page not found
+annual report
+media inquiries
+communications portal
+
+# 中文常见
+新闻发布
+网站地图
+术语表
+关于我们
+联系我们
+首页
+搜索结果
