@@ -25,7 +25,7 @@ from utils import get_logger, parse_json_object, reg_hash
 from ._shared import (
     FALLBACK_SYSTEM, FALLBACK_PROMPT_TMPL,
     SYNTHESIS_WARNING, PRODUCT_LIST,
-    safe_print, truncate_smart,
+    safe_print, truncate_smart, strip_injection_markers,
 )
 from .values import build_analysis_values, insert_analysis_row
 
@@ -184,7 +184,7 @@ def _fallback_one(idx: int, total: int, row) -> str:
         url=url or "（未知）",
         market=market or "（未知）",
         relevance=relevance or "（无说明）",
-        scraped_text=truncate_smart(synth_text),
+        scraped_text=strip_injection_markers(truncate_smart(synth_text)),
         product_list=PRODUCT_LIST,
     )
 

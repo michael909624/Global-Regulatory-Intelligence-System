@@ -38,9 +38,10 @@ def build_analysis_values(
     market: str,
     extra_biz: str | None,
 ) -> dict:
-    importance = (result.get("importance") or "🟢").strip()
-    if importance not in VALID_IMPORTANCE:
-        importance = "🟢"
+    # importance 由下游 llm_priority 在 reporter 阶段集中判定（写入 ai_priority）。
+    # main analyzer 不再要求输出此字段——若 LLM 仍输出，存为兼容数据；否则 NULL。
+    raw_importance = (result.get("importance") or "").strip()
+    importance = raw_importance if raw_importance in VALID_IMPORTANCE else None
 
     products = normalize_products(result.get("affected_products", ""))
 
@@ -59,10 +60,38 @@ def build_analysis_values(
 
     dates_raw    = result.get("dates") or {}
     enforcements = dates_raw.get("enforcements") or []
-    key_dates    = json.dumps({
-        "publish":            dates_raw.get("publish"),
-        "effective":          dates_raw.get("effective"),
-        "enforcements":       enforcements if isinstance(enforcements, list) else [],
+
+    # Sanity check：effective 早于 publish 是 LLM 幻觉的明显标志
+    # （常见 LLM 错把"母法规生效日"和"修订法案发布日"混合）
+    # 经典案例：UK e-scooter pub=2026-04-29 eff=2026-01-01 — 差 4 个月不可能
+    # 处理：异常时丢弃 effective（让其为 null），enforcements 数组里同样过滤
+    pub_str = dates_raw.get("publish")
+    eff_str = dates_raw.get("effective")
+    eff_clean = eff_str
+    if pub_str and eff_str:
+        try:
+            pub_d = pub_str[:10]
+            eff_d = eff_str[:10]
+            # 字符串日期比较（YYYY-MM-DD 字典序==时间序）
+            if eff_d < pub_d:
+                eff_clean = None  # 弃用错位的 effective
+        except Exception:
+            pass
+
+    # enforcements 数组里 date < publish 的也清掉
+    cleaned_enf = []
+    if isinstance(enforcements, list):
+        for e in enforcements:
+            if isinstance(e, dict) and pub_str:
+                d = (e.get("date") or "")[:10]
+                if d and d < pub_str[:10]:
+                    continue  # 强制日早于发布日 = 幻觉
+            cleaned_enf.append(e)
+
+    key_dates = json.dumps({
+        "publish":            pub_str,
+        "effective":          eff_clean,
+        "enforcements":       cleaned_enf,
         "consultation_close": dates_raw.get("consultation_close"),
     }, ensure_ascii=False)
 

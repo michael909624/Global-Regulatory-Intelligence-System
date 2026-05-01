@@ -46,6 +46,30 @@ _TITLE_STOPWORDS = {
 }
 
 
+# ── 导航/非法规 title 识别 ────────────────────────────────────────────────────
+# Stage 0 同 reg_id 聚类时，如果成员里混进"高权威域名 + 无关 title"的条目
+# （如 eur-lex 域下挂的 "Press Release / Site Map / Glossary"），仅按 authority.score
+# 选 keeper 会让真法规被合并到无关 keeper → 主分析按无关 title 判不相关 → 漏召回。
+#
+# 加这一层"非法规 title"识别，让 keeper 选择优先合规相关的成员。
+_NAVIGATION_TITLE_PATTERNS = [
+    "press release", "site map", "sitemap", "glossary", "table of contents",
+    "about us", "contact us", "cookie policy", "privacy policy",
+    "homepage", "home page", "search results", "page not found",
+    "annual report", "media inquiries", "communications portal",
+    "新闻发布", "网站地图", "术语表", "关于我们", "联系我们", "首页", "搜索结果",
+]
+
+
+def _is_navigation_title(title: str | None) -> bool:
+    """识别非法规 title——含导航/通讯/无义务页面关键词。
+    Stage 0 keeper 选择时这类 title 排到末尾，避免抢占真法规的 keeper 位。"""
+    if not title:
+        return True
+    t = title.lower()
+    return any(p in t for p in _NAVIGATION_TITLE_PATTERNS)
+
+
 # ── reg_id 归一化 ──────────────────────────────────────────────────────────────
 #
 # 把模型自报的多种写法折叠到统一的聚类键。例：
@@ -61,9 +85,6 @@ _TITLE_STOPWORDS = {
 # 在 Stage 0 视作不同组（两者通过 ALIAS/EU 路径独立归一） —— 跨家族合并交给 Stage 3。
 
 _ALIAS_MAP = {
-    r"\bCRA\b|CYBER\s+RESILIENCE\s+ACT":          "CRA",
-    r"\bAI\s+ACT\b":                              "AI_ACT",
-    r"\bBATTERY\s+REGULATION\b":                  "BATTERY_REG",
     r"\bPSTI\b|PRODUCT\s+SECURITY\s+(?:&|AND)\s+TELECOM": "PSTI",
     r"\bRO?HS\b":                                 "ROHS",
     r"\bREACH\b":                                 "REACH",
@@ -76,20 +97,39 @@ _ALIAS_MAP = {
     r"\bPHMSA\b":                                 "US_HMR",
 }
 
+# ALIAS → CELEX 反向映射：让别名条目（"CRA"、"AI Act"、"Battery Regulation"）
+# 和 CELEX 条目（EU/2024/2847）落到同一聚类 key，根治"同一法规 5 个 reg_id"
+# 漏合并问题。优先级高于 _ALIAS_MAP（在 normalize_reg_id 里先匹配）。
+_ALIAS_TO_CELEX = {
+    r"\bCRA\b|CYBER\s+RESILIENCE\s+ACT":          "EU/2024/2847",
+    r"\bAI\s+ACT\b|ARTIFICIAL\s+INTELLIGENCE\s+ACT": "EU/2024/1689",
+    r"\bBATTERY\s+REGULATION\b|BATTERIES\s+REGULATION": "EU/2023/1542",
+    r"MACHINERY\s+REGULATION":                    "EU/2023/1230",
+}
+
 _STD_PREFIXES = ("EN", "IEC", "UL", "ISO", "JIS", "AS/NZS", "AIS", "ANSI", "CSA", "BS")
 
 
 def normalize_reg_id(raw: str | None) -> str | None:
-    """归一化模型自报的 reg_id 到聚类键；返回 None 表示无法归类。"""
+    """归一化模型自报的 reg_id 到聚类键；返回 None 表示无法归类。
+
+    设计：先尝试抽 CELEX / EU 编号（强信号），命中即归一。这样
+    "32024R2847" / "32024R2847 Deadlines" / "32024R2847_Guidance"
+    都归到同一 EU/2024/2847；CRA / AI Act 等已知别名也通过
+    _ALIAS_TO_CELEX 反向映射到对应 CELEX。
+    """
     if not raw:
         return None
     s = raw.strip()
     if not s:
         return None
-    upper = s.upper()
+    # 下划线在 \b 视角是 word char，会破坏词边界检测
+    # （"CRA_Guidance" 里 \bCRA\b 不命中）。先转成空格再做正则。
+    upper = s.upper().replace("_", " ")
 
-    # CELEX → EU/YYYY/NNN
-    m = re.match(r"^3(\d{4})[RLDC](\d{4})$", upper)
+    # CELEX → EU/YYYY/NNN（用 search 而非 match：含后缀/前缀的字符串也能抽出）
+    # 支持 4 位或 5 位顺序号：32024R2847 / 32023R1542 / 32024R0900
+    m = re.search(r"\b3(\d{4})[RLDC](\d{1,5})\b", upper)
     if m:
         return f"EU/{m.group(1)}/{int(m.group(2))}"
 
@@ -104,6 +144,11 @@ def normalize_reg_id(raw: str | None) -> str | None:
     )
     if m:
         return f"EU/{m.group(1)}/{int(m.group(2))}"
+
+    # 别名优先映射到对应 CELEX（让 "CRA" / "AI Act" 等条目和 CELEX 条目同组）
+    for pat, celex_key in _ALIAS_TO_CELEX.items():
+        if re.search(pat, upper):
+            return celex_key
 
     # 美国 CFR
     m = re.search(r"\b(\d{1,3})\s*CFR\s*(?:PART\s*)?(\d+)", upper)
@@ -217,7 +262,14 @@ def _llm_cluster_residual(rows: list, business_scope: str) -> list[list[int]]:
     prompt = prompts.load("cluster_residual").format(n=len(valid_ids), entries=entries)
 
     try:
-        resp = ai_client.call_json(prompt, system=system)
+        # Stage 0 LLM 聚类 — 语义判断"条目 A 和 B 是不是同一法规"。
+        # 候选已用 Jaccard 粗筛过滤，进 LLM 的都是高度相似的 token 集，
+        # lite + 关 thinking 完全胜任，flash 是浪费。
+        resp = ai_client.call_json(
+            prompt, system=system,
+            model="gemini-2.5-flash-lite",
+            thinking_budget=0,
+        )
     except Exception as e:
         _log.warning("Stage 0 LLM cluster failed: %s", e)
         return []
@@ -375,10 +427,12 @@ def consolidate_pending(verbose: bool = True) -> tuple[int, int, int]:
         fallback_list = ranked[1:6]
         fallback_json = json.dumps(fallback_list, ensure_ascii=False) if fallback_list else None
 
-        # 主条目 = source_url 与 primary_url 匹配的成员，或权威分最高的成员
+        # 主条目选择：优先非导航 title（防止"高权威域名 + 无关 title"抢占 keeper），
+        # 其次权威分，再次 primary URL 匹配，最后 ID 最小者
         keeper = max(
             members,
             key=lambda r: (
+                0 if _is_navigation_title(r["title"]) else 1,
                 authority.score(r["source_url"] or ""),
                 1 if (r["source_url"] or "") == primary_url else 0,
                 -r["id"],

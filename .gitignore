@@ -13,6 +13,8 @@ __pycache__/
 # 数据库 / 日志 / 报告(本地数据,不需要上传)
 data/*.db
 data/*.sqlite
+data/*.bak*
+data/.DS_Store
 logs/
 reports/
 

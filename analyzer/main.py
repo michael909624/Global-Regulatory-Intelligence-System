@@ -29,7 +29,7 @@ from ._shared import (
     SYSTEM, PROMPT_TMPL,
     FALLBACK_SYSTEM, FALLBACK_PROMPT_TMPL,
     SYNTHESIS_WARNING,
-    safe_print, truncate_smart,
+    safe_print, truncate_smart, strip_injection_markers,
 )
 from .values import build_analysis_values, insert_analysis_row
 from .fallback import (
@@ -78,7 +78,7 @@ def _analyze_one(idx: int, total: int, sc_row) -> str:
     url       = (raw["source_url"] if raw else "") or ""
     market    = (raw["market"]     if raw else "") or ""
     relevance = (raw["snippet"]    if raw else "") or ""
-    full_text = truncate_smart(sc_row["full_text"] or "")
+    full_text = strip_injection_markers(truncate_smart(sc_row["full_text"] or ""))
 
     if not full_text.strip():
         mark_analyzed(sc_row["id"])

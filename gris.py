@@ -116,12 +116,15 @@ def cmd_backfill(args: list[str]):
             "只输出 URL 本身，不含任何解释。若无法确认则输出 null。"
         )
         try:
+            # URL 回填是简单事实查询（"找一个官方链接"），不需要 thinking。
+            # 用 lite-grounded + 关 thinking 节省成本（thinking 在此处 ~ 0 增益）。
             text, _ = ai_client.call_grounded(
                 prompt,
                 system=backfill_system,
                 temperature=0.0,
                 top_p=None,
                 return_sources=False,
+                thinking_budget=0,
             )
             url = text.strip().strip('"').strip("'")
             if url and url.lower() != "null" and url.startswith("http"):
@@ -169,7 +172,7 @@ def cmd_run(args: list[str]):
 
     mode_label = "快速（仅新发布）" if quick else "全量（新发布 + 即将生效）"
 
-    print(f"\n[1/5] Gemini 发现层（{mode_label}）...")
+    print(f"\n[1/7] Gemini 发现层（{mode_label}）...")
     t0 = time.time()
     try:
         inserted, skipped = researcher.run_research(quick=quick)
@@ -179,7 +182,7 @@ def cmd_run(args: list[str]):
         print(f"      ❌ 错误 ({_elapsed(t0)})：{e}")
         results["发现"] = (False, str(e))
 
-    print("\n[2/5] 法规编号聚类（Stage 0）...")
+    print("\n[2/7] 法规编号聚类（Stage 0）...")
     t0 = time.time()
     try:
         groups, merged, untouched = consolidator.consolidate_pending(verbose=True)
@@ -189,7 +192,18 @@ def cmd_run(args: list[str]):
         print(f"      ❌ 错误 ({_elapsed(t0)})：{e}")
         results["聚类"] = (False, str(e))
 
-    print("\n[3/5] 抓取法规原文...")
+    print("\n[3/7] 早期 AI 预筛（triage）...")
+    t0 = time.time()
+    try:
+        from analyzer.llm_triage import triage_pending
+        pursued, dropped = triage_pending(verbose=False)
+        print(f"      完成 ({_elapsed(t0)})  pursue {pursued} / drop {dropped}")
+        results["预筛"] = (True, f"pursue {pursued} / drop {dropped}")
+    except Exception as e:
+        print(f"      ❌ 错误 ({_elapsed(t0)})：{e}")
+        results["预筛"] = (False, str(e))
+
+    print("\n[4/7] 抓取法规原文...")
     t0 = time.time()
     try:
         ok, fail, manual = scraper.scrape_all()
@@ -199,7 +213,7 @@ def cmd_run(args: list[str]):
         print(f"      ❌ 错误 ({_elapsed(t0)})：{e}")
         results["抓取"] = (False, str(e))
 
-    print("\n[4/5] 合规分析（基于抓取原文）...")
+    print("\n[5/7] 合规分析（基于抓取原文）...")
     t0 = time.time()
     try:
         n_analyzed, n_dup, n_fail = analyzer.run_analysis()
@@ -209,7 +223,18 @@ def cmd_run(args: list[str]):
         print(f"      ❌ 错误 ({_elapsed(t0)})：{e}")
         results["分析"] = (False, str(e))
 
-    print("\n[5/5] 生成周报...")
+    print("\n[6/7] 末端 AI 终审（judge L1/L2/P0/P1）...")
+    t0 = time.time()
+    try:
+        from analyzer.llm_priority import judge_pending
+        n_judged = judge_pending(verbose=False)
+        print(f"      完成 ({_elapsed(t0)})  终审 {n_judged} 条")
+        results["终审"] = (True, f"{n_judged} 条")
+    except Exception as e:
+        print(f"      ❌ 错误 ({_elapsed(t0)})：{e}")
+        results["终审"] = (False, str(e))
+
+    print("\n[7/7] 生成周报...")
     t0 = time.time()
     report_path = None
     try:
@@ -240,6 +265,26 @@ def cmd_consolidate(_args: list[str]):
     """Stage 0：法规编号聚类（在 scrape 之前对 reg_id 相同的条目软合并）。"""
     from consolidator import run_consolidation_command
     run_consolidation_command()
+
+
+def cmd_triage(_args: list[str]):
+    """早期 AI 预筛：批量看 raw 标题清单，drop 单次召回/媒体/跨主题误命中等噪音。
+    drop 的 raw 不会被 scraper 抓取，节省下游 30-50% 调用成本。"""
+    import ai_client
+    from analyzer.llm_triage import triage_pending
+    ai_client.reset_token_stats()
+    triage_pending()
+    ai_client.print_token_summary("  ")
+
+
+def cmd_judge(_args: list[str]):
+    """末端 AI 终审：批量判定 ai_level (L1/L2) + ai_priority (P0/P1/drop)。
+    取代 priority.py 启发式作为主判定。reporter 优先读 ai_priority 字段。"""
+    import ai_client
+    from analyzer.llm_priority import judge_pending
+    ai_client.reset_token_stats()
+    judge_pending()
+    ai_client.print_token_summary("  ")
 
 
 def cmd_scrape(args: list[str]):
@@ -511,8 +556,10 @@ _MENU: list[tuple[str, str] | None] = [
     ("run",         "完整流水线：Gemini情报研究 → 生成报告  附加：--quick（仅新发布）"),
     ("research",    "Gemini 情报研究（搜索+合成）  附加：--quick"),
     ("consolidate", "法规编号聚类（Stage 0）：同 reg_id 软合并到主条目"),
+    ("triage",      "早期 AI 预筛：drop 噪音 raw 不进 scraper（治本架构）"),
     ("scrape",      "抓取所有待处理 URL 的网页正文"),
     ("analyze",  "对已抓取内容进行 AI 合规分析"),
+    ("judge",    "末端 AI 终审：判定 L1/L2 + P0/P1（取代 priority 启发式）"),
     ("report",   "生成 Excel 周报（保存至 reports/）"),
     None,
     ("view",     "终端查看分析结果  附加参数：高/中/低  [条数，默认20]"),
@@ -600,8 +647,10 @@ COMMANDS = {
     "research":    cmd_research,
     "backfill":    cmd_backfill,
     "consolidate": cmd_consolidate,
+    "triage":      cmd_triage,
     "scrape":      cmd_scrape,
     "analyze":     cmd_analyze,
+    "judge":       cmd_judge,
     "report":      cmd_report,
     "view":        cmd_view,
     "status":      cmd_status,

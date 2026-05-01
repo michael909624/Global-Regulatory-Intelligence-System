@@ -6,6 +6,7 @@ analyzer 包共享：常量、提示词、文本截断、并发安全打印。
 """
 from __future__ import annotations
 
+import re
 import threading
 
 import prompts
@@ -29,6 +30,39 @@ def truncate_smart(text: str) -> str:
     tail = text[-_TAIL_CHARS:]
     omitted = len(text) - _HEAD_CHARS - _TAIL_CHARS
     return f"{head}\n\n[...中部 {omitted:,} 字符已省略，保留头部适用范围 + 尾部罚则/强制日...]\n\n{tail}"
+
+
+# ── prompt injection 防御 ─────────────────────────────────────────────────────
+# 真实环境下抓回的法规原文偶尔会含恶意 prompt injection（被入侵的网站、
+# 攻击者投放的伪法规页等）。LLM 看到 "ignore previous instructions" 等指令时
+# 有不可忽略的中招概率，会按攻击者指令输出"不相关"使真法规漏召回。
+#
+# 这里的防御不是"完美抵抗 injection"——根治需要 LLM 厂商侧的 system prompt 加固。
+# 我们只剥离已知模式的明显注入标记，让喂给 LLM 的内容尽量干净。
+_INJECTION_PATTERNS = [
+    re.compile(r"system\s+override\s*:.*", re.IGNORECASE | re.DOTALL),
+    re.compile(r"ignore\s+(?:the\s+above|all\s+previous|previous\s+instructions).*",
+               re.IGNORECASE | re.DOTALL),
+    re.compile(r"\[admin\s+note[^\]]*\].*", re.IGNORECASE | re.DOTALL),
+    re.compile(r"the\s+user\s+has\s+updated\s+(?:the\s+)?rules.*",
+               re.IGNORECASE | re.DOTALL),
+    re.compile(r"output\s+only\s+the\s+following\s+(?:json|response).*",
+               re.IGNORECASE | re.DOTALL),
+    re.compile(r"actual\s+classification\s+per\s+agency\s+memo.*",
+               re.IGNORECASE | re.DOTALL),
+]
+
+
+def strip_injection_markers(text: str) -> str:
+    """剥离已知 prompt injection 模式段落（从 marker 开始到末尾）。
+    设计上偏保守：只删命中明显模式的部分，宁可漏删也不冤删合规原文。
+    """
+    if not text:
+        return text
+    out = text
+    for pat in _INJECTION_PATTERNS:
+        out = pat.sub("", out)
+    return out
 
 
 # ── 业务枚举 ──────────────────────────────────────────────────────────────────

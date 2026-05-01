@@ -17,7 +17,7 @@ from datetime import datetime
 from config import DATABASE_PATH
 from utils import get_logger
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 _log = get_logger("database")
 
 
@@ -74,7 +74,10 @@ _DDL_LATEST = """
                          CHECK(scrape_status IN ('待抓取','已抓取','失败','需人工')),
         fallback_urls    TEXT,
         reg_id           TEXT,
-        consolidated_into INTEGER REFERENCES raw_search_results(id)
+        consolidated_into INTEGER REFERENCES raw_search_results(id),
+        -- 早期 AI 预筛（llm_triage）：在抓取前判定是否值得跑下游全流程
+        triage_decision  TEXT,  -- 'pursue' | 'drop' | NULL（未判定）
+        triage_reason    TEXT
     );
 
     CREATE TABLE IF NOT EXISTS scraped_content (
@@ -108,7 +111,11 @@ _DDL_LATEST = """
         content_hash                TEXT,
         source_institution          TEXT,
         source_language             TEXT,
-        analysis_date               TEXT NOT NULL
+        analysis_date               TEXT NOT NULL,
+        -- 末端 AI 终审（llm_priority）：覆盖 priority.py 启发式
+        ai_level                    TEXT,  -- 'L1' | 'L2' | NULL
+        ai_priority                 TEXT,  -- 'P0' | 'P1' | 'drop' | NULL
+        ai_reason                   TEXT
     );
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_analysis_content_hash
@@ -162,6 +169,8 @@ def _bootstrap_or_migrate(conn: sqlite3.Connection) -> None:
         _migrate_to_v8(conn)
     if cur_v < 9:
         _migrate_to_v9(conn)
+    if cur_v < 10:
+        _migrate_to_v10(conn)
 
     conn.execute("DELETE FROM schema_version")
     conn.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
@@ -251,6 +260,34 @@ def _migrate_to_v9(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE raw_search_results DROP COLUMN {col}")
             except sqlite3.OperationalError as e:
                 _log.warning("DROP COLUMN raw_search_results.%s skipped: %s", col, e)
+
+
+def _migrate_to_v10(conn: sqlite3.Connection) -> None:
+    """v9→v10：加 5 个 LLM 判定列，让 AI 主导判定取代 priority.py 启发式。
+
+    raw_search_results.triage_decision / triage_reason
+        早期 AI 预筛（llm_triage）：抓回标题清单后批量判定"是否值得跑下游"，
+        drop 的不进 scraper，节省 30-50% main analyzer + fallback 调用。
+
+    compliance_analysis.ai_level / ai_priority / ai_reason
+        末端 AI 终审（llm_priority）：reporter 渲染前批量判定 L1/L2 + P0/P1，
+        覆盖 priority.py 启发式。reporter 优先读这三列；缺失才走 priority 兜底。
+
+    新加列均默认 NULL，向后兼容（旧数据走 priority 兜底）。
+    """
+    new_cols = [
+        ("raw_search_results",  "triage_decision",  "TEXT"),
+        ("raw_search_results",  "triage_reason",    "TEXT"),
+        ("compliance_analysis", "ai_level",         "TEXT"),
+        ("compliance_analysis", "ai_priority",      "TEXT"),
+        ("compliance_analysis", "ai_reason",        "TEXT"),
+    ]
+    for table, col, type_ in new_cols:
+        if not _column_exists(conn, table, col):
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {type_}")
+            except sqlite3.OperationalError as e:
+                _log.warning("ADD COLUMN %s.%s skipped: %s", table, col, e)
 
 
 def _migrate_importance_emoji(conn: sqlite3.Connection) -> None:
@@ -362,11 +399,16 @@ def get_raw_result(raw_id: int) -> sqlite3.Row | None:
 
 
 def get_pending_scrape() -> list[sqlite3.Row]:
-    """待抓取条目；自动跳过 Stage 0 软合并的从条目（consolidated_into 非空）。"""
+    """待抓取条目；自动跳过：
+       1. Stage 0 软合并的从条目（consolidated_into 非空）
+       2. 早期 AI 预筛标 drop 的条目（triage_decision='drop' — 治本架构 v10）
+    """
     with get_connection() as conn:
         return conn.execute(
             "SELECT * FROM raw_search_results "
-            "WHERE scrape_status = '待抓取' AND consolidated_into IS NULL"
+            "WHERE scrape_status = '待抓取' "
+            "  AND consolidated_into IS NULL "
+            "  AND (triage_decision IS NULL OR triage_decision != 'drop')"
         ).fetchall()
 
 
@@ -424,7 +466,10 @@ _REPORT_SELECT = """
         rs.title_cn,
         ca.compliance_requirement,
         COALESCE(ca.affected_products_display, ca.affected_products) AS affected_products_display,
+        ca.affected_products,
         ca.affected_markets,
+        ca.market_tier,
+        rs.reg_id,
         ca.compliance_deadline,
         ca.key_dates,
         rs.source_url,
@@ -436,6 +481,10 @@ _REPORT_SELECT = """
         ca.analysis_date,
         ca.source_institution,
         ca.source_language,
+        ca.ai_level,
+        ca.ai_priority,
+        ca.ai_reason,
+        ca.id AS ca_id,
         CASE WHEN sc.full_text LIKE '[Gemini synthesis]%' THEN 1 ELSE 0 END AS is_synth
     FROM compliance_analysis ca
     JOIN scraped_content      sc ON sc.id = ca.scraped_id
@@ -460,9 +509,12 @@ _REPORT_SELECT = """
 
 _REPORT_ORDER = """
     ORDER BY
+        -- 第一优先：重要度（🔴 → 🟡 → 🟢）
         CASE ca.impact_level WHEN '🔴' THEN 1 WHEN '🟡' THEN 2 WHEN '🟢' THEN 3 ELSE 9 END,
+        -- 第二优先：区域（0 全球 / 1 欧盟 / 2 欧国 / 3 北美 / 4 美联邦 ...）
         COALESCE(ca.market_tier, 99),
         COALESCE(ca.affected_markets, ''),
+        -- 第三优先：产品（短交通 → ebike → 电摩 → 割草机）
         CASE
             WHEN COALESCE(ca.affected_products_display, ca.affected_products) LIKE '%短交通%' THEN 1
             WHEN COALESCE(ca.affected_products_display, ca.affected_products) LIKE '%ebike%'

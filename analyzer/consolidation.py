@@ -338,8 +338,14 @@ def _llm_consolidate_group(group: list, topic_hint: str, all_ids: set[int]) -> t
         n=len(group), topic_hint=topic_hint, entries=entries_text,
     )
     try:
+        # Stage 3 Pass 2 候选已按 (产品, 重要度, dims) 预分组——高度相似的条目
+        # 进入 LLM 时 LLM 只需做"是否同一法规"的二元判断，不需要复杂多步推理。
+        # 用 lite + 关 thinking 节省成本；下游 _is_contradictory 会兜底拒收
+        # LLM 自相矛盾的合并，所以 lite 偶尔误判不会污染数据。
         resp_text = ai_client.call_json(
             prompt, system=_CONSOLIDATION_SYSTEM,
+            model="gemini-2.5-flash-lite",
+            thinking_budget=0,
         )
     except Exception as e:
         _log.warning("Consolidation call failed for %s: %s", topic_hint, e)

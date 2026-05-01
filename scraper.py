@@ -80,7 +80,13 @@ _PLACEHOLDER_MARKS = (
 # 真法规页必然包含自己的标识（编号、缩写、关键词）。命中率 < 阈值
 # = 抓到的不是这份法规（典型场景：URL 是 host-only，抓回的是首页全文，
 # 看似内容充足但跟标题完全无关，AI 主分析会凭训练知识凭空发挥）。
-_TITLE_HIT_RATE = 0.30   # 至少命中 30% 的核心 token
+#
+# 阈值演进（数据驱动）：
+#   v1: 30% + 子串匹配 → NSW 案例漏（"new" 命中 "news"，长 title 偶然蒙混）
+#   v2: 50% + 词边界匹配（拉丁）+ 长 title 双门槛 hits≥4
+_TITLE_HIT_RATE = 0.50   # 至少命中 50% 的核心 token
+_TITLE_LONG_THRESHOLD = 6  # 长 title 门槛（核心 token 数 ≥ 此值时启用 hits≥4 双门槛）
+_TITLE_LONG_MIN_HITS = 4   # 长 title 必须的最小绝对命中数
 
 # title token 提取的停用词——剥离常见法规修饰词后再做命中率判断
 _TITLE_STOPWORDS_EN = {
@@ -186,6 +192,20 @@ def _is_year_like(t: str) -> bool:
     return t.isdigit() and len(t) == 4 and 1900 <= int(t) <= 2100
 
 
+_CJK_RE = re.compile(r"[一-鿿぀-ヿ가-힯]")
+
+
+def _token_in_text(token: str, low_text: str) -> bool:
+    """token 是否在文本里出现。
+
+    拉丁词用词边界（避免 'new' 命中 'news'/'newsletter'）；
+    CJK 词维持子串匹配（中文无空格分词，词边界对 CJK 不适用）。
+    """
+    if _CJK_RE.search(token):
+        return token in low_text
+    return re.search(rf"\b{re.escape(token)}\b", low_text, flags=re.UNICODE) is not None
+
+
 def _content_matches_title(
     text: str, title: str | None, reg_id: str | None = None,
 ) -> tuple[bool, float, int]:
@@ -195,9 +215,11 @@ def _content_matches_title(
 
     判定规则（必要条件）：
       • 强证据：reg_id 完整签名（'ekfv 2026', 'bc-15/18'）出现在原文 → 直接通过
-      • 弱证据：核心 token 命中率 ≥ 30% AND 绝对命中数 ≥ 2
-        （绝对数门槛防"单个偶然命中"——例：BMV 首页恰好提到 Elektrokleinstfahrzeuge
-         一次就被通过，但 ekfv/sechste 都没出现，说明不是真正文）
+      • 弱证据：核心 token 命中率 ≥ 50%（拉丁词用 \\b 词边界匹配，CJK 子串）
+        - 短 title（< 6 token）：另需 hits ≥ 2
+        - 长 title（≥ 6 token）：另需 hits ≥ 4
+          （门槛随 token 数提升——首页里偶然提到一两个地名/通用词
+          就能蒙过老门槛 30%，但 50%+绝对数下限挡得住）
       • token 数 < 2 一律放行（无法判定）
 
     年份类 token（'2024'/'2026'）会被排除——年份在任何页面都常见，无信号价值。
@@ -214,12 +236,13 @@ def _content_matches_title(
     if reg_id:
         title_tokens |= _extract_title_tokens(reg_id)
     title_tokens = {t for t in title_tokens if not _is_year_like(t)}
-    if len(title_tokens) < 2:
-        return True, 1.0, len(title_tokens)
-    hits = sum(1 for t in title_tokens if t in low)
-    rate = hits / len(title_tokens)
-    # 绝对命中数门槛：至少 2 个 token 命中（防偶然单词命中通过）
-    return (rate >= _TITLE_HIT_RATE and hits >= 2), rate, len(title_tokens)
+    n_tokens = len(title_tokens)
+    if n_tokens < 2:
+        return True, 1.0, n_tokens
+    hits = sum(1 for t in title_tokens if _token_in_text(t, low))
+    rate = hits / n_tokens
+    min_hits = _TITLE_LONG_MIN_HITS if n_tokens >= _TITLE_LONG_THRESHOLD else 2
+    return (rate >= _TITLE_HIT_RATE and hits >= min_hits), rate, n_tokens
 
 
 def _looks_like_placeholder(
@@ -243,6 +266,76 @@ def _looks_like_placeholder(
     if not ok:
         return f"内容与标题无关(命中{rate:.0%}/{n_tokens}词)"
     return None
+
+
+# ── 软 404 重定向检测 ─────────────────────────────────────────────────────────
+# 深层文章 URL 被站点静默 301/302 到 section 首页/落地页：HTTP 200 + 完整 HTML，
+# 但内容跟标题完全无关。比靠后续 token 命中率事后判定更早一步、零误差。
+# 典型案例：fairtrading.nsw.gov.au/news-and-updates/newsflash/article-slug
+#         → www.nsw.gov.au/departments-and-agencies/fair-trading（首页）
+
+def _path_segments(url: str) -> list[str]:
+    """URL path 拆段（去 leading/trailing slash + 空段过滤）。"""
+    if not url:
+        return []
+    p = urlparse(url).path.strip("/")
+    return [s for s in p.split("/") if s]
+
+
+def _norm_host(host: str) -> str:
+    """标准化 host：去 www. 前缀。其他子域差异保留（不同子域=不同站）。"""
+    h = (host or "").lower()
+    return h[4:] if h.startswith("www.") else h
+
+
+def _is_soft_404_redirect(orig_url: str, final_url: str) -> str | None:
+    """检测重定向后是否落到了软 404 / 通用落地页。返回原因；None 表示通过。
+
+    判定规则（任一命中即软 404）：
+      • 路径段数骤降 ≥ 2（深层文章被拍平到 section 首页/列表页）
+      • 域名变更 AND 原路径 ≥ 3 段 AND 终态路径 ≤ 2 段
+        （站点重组把深层 URL 兜到一级落地页，典型 NSW Fair Trading 模式）
+
+    不触发的正常重定向（路径段数差 ≤ 1）：
+      HTTPS 升级、www 加减、trailing slash、语言后缀切换、单层目录改名。
+    """
+    if not orig_url or not final_url or orig_url == final_url:
+        return None
+    orig = urlparse(orig_url)
+    final = urlparse(final_url)
+    n_orig = len(_path_segments(orig_url))
+    n_final = len(_path_segments(final_url))
+    if n_orig - n_final >= 2:
+        return f"路径骤降({n_orig}→{n_final})"
+    if (_norm_host(orig.netloc) != _norm_host(final.netloc)
+            and n_orig >= 3 and n_final <= 2):
+        return f"跨域兜底({orig.netloc}→{final.netloc}, 路径{n_orig}→{n_final})"
+    return None
+
+
+# 同 host 文本指纹去重——跨 URL 拿到字节级相同前缀的站点级软 404 信号
+# （首页/列表页被站点静默兜底反复 serve）
+_host_fingerprints: dict[str, set[str]] = defaultdict(set)
+_fingerprint_lock = threading.Lock()
+
+
+def _text_fingerprint(text: str) -> str | None:
+    """文本前缀的 md5 指纹。取 [200:2200] 区间避免站点级 header/导航的虚假相同。"""
+    if not text or len(text) < 400:
+        return None
+    import hashlib
+    return hashlib.md5(text[200:2200].encode("utf-8", "replace")).hexdigest()
+
+
+def _host_seen_fingerprint(host: str, fp: str) -> bool:
+    """指纹是否在该 host 下已出现过。第一次见即记入并返回 False。"""
+    with _fingerprint_lock:
+        seen = _host_fingerprints[host]
+        if fp in seen:
+            return True
+        seen.add(fp)
+        return False
+
 
 # per-domain 速率控制
 _PER_DOMAIN_GAP = 1.5     # 同域请求间隔下限（秒）
@@ -373,6 +466,41 @@ def _recover_gov_uk(title: str) -> str | None:
     return best_url if best_overlap >= 3 else None
 
 
+# ── Wayback Machine 兜底 ──────────────────────────────────────────────────────
+# scraper.log 里 778 条 404+DNS+timeout（73% 的 warning），其中 .gov 站点
+# 大多被 archive.org 收录。在所有候选 URL 都失败前调一次快照查询，能直接
+# 救回大量"原文存在但当前死链"的法规，把对 Gemini 合成兜底的依赖打下来。
+
+_WAYBACK_API = "https://archive.org/wayback/available"
+
+
+def _recover_wayback(url: str) -> str | None:
+    """查 Wayback Machine 是否有该 URL 的快照，返回最近一份快照 URL；无则 None。
+
+    注：Wayback API 不接受 percent-encoded URL（requests 的 params=
+    会把 https:// 编成 https%3A%2F%2F → 服务返回空 snapshots）。
+    必须手拼裸 URL。
+    """
+    if not url or not url.startswith("http"):
+        return None
+    try:
+        resp = requests.get(
+            f"{_WAYBACK_API}?url={url}",
+            headers={"User-Agent": _HEADERS["User-Agent"]},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json() or {}
+        snap = ((data.get("archived_snapshots") or {})
+                .get("closest") or {})
+        if snap.get("available") and snap.get("url"):
+            return snap["url"]
+    except Exception as e:
+        _log.warning("wayback lookup failed for %s: %s", url, e)
+    return None
+
+
 def _wait_for_domain(host: str) -> None:
     with _domain_lock:
         last = _domain_last_hit[host]
@@ -462,6 +590,15 @@ def scrape_url(url: str) -> tuple[str | None, str, bool]:
             return None, "unknown", False
 
         resp.raise_for_status()
+
+        # 软 404 重定向检测：深层 URL 被站点静默兜到首页/落地页
+        # 比内容启发式更早、更精确（path 比较仅几行，零误伤）
+        soft_reason = _is_soft_404_redirect(url, resp.url)
+        if soft_reason:
+            _log.warning("soft-404 redirect %s → %s: %s",
+                         url, resp.url, soft_reason)
+            return None, "unknown", False
+
         ct = resp.headers.get("Content-Type", "").lower()
         is_pdf = force_pdf or "pdf" in ct or url.lower().split("?")[0].endswith(".pdf")
 
@@ -541,18 +678,38 @@ def _try_scrape_chain(row) -> tuple[str | None, str, bool, str | None]:
         if rec and rec not in candidates:
             candidates.append(rec)
 
+    # 主循环：依序试每个候选，三层质量校验（指纹去重 / 占位页 / 标题相关性）
+    # 任一拒收即换下一个；所有候选都失败再试 Wayback。
     for url in candidates:
         text, ctype, truncated = scrape_url(url)
         if not text:
             continue
-        # 占位/空壳检测：命中则视为本 candidate 失败，继续下一个；
-        # 全部 candidate 都是空壳 → 返回 None → _scrape_one 标 raw='失败'
-        # → analyzer/fallback 路径接管，用 grounded 合成（带 ⚠️）
+        # 同 host 文本指纹去重：站点级软 404 的隐性指纹——同一 host 下
+        # 多个不同 URL 抓回字节级相同前缀（首页/列表页被反复兜底服务）
+        host = _norm_host(urlparse(url).netloc)
+        fp = _text_fingerprint(text)
+        if fp and _host_seen_fingerprint(host, fp):
+            _log.warning("同 host 重复文本拒收 %s (host=%s)", url, host)
+            continue
+        # 占位 / 空壳 / 标题不相关检测（_looks_like_placeholder 四层防御）
         reason = _looks_like_placeholder(text, title, reg_id)
         if reason:
             _log.warning("占位页拒收 %s: %s", url, reason)
             continue
         return text, ctype, truncated, url
+
+    # 全部直接候选失败 → Wayback Machine 快照兜底
+    # 覆盖 778 条 404+DNS+timeout 死链场景，特别是 .gov 官方文档
+    if main_url:
+        wb = _recover_wayback(main_url)
+        if wb:
+            _log.info("wayback fallback %s → %s", main_url, wb)
+            text, ctype, truncated = scrape_url(wb)
+            if text:
+                reason = _looks_like_placeholder(text, title, reg_id)
+                if not reason:
+                    return text, ctype, truncated, wb
+                _log.warning("wayback 占位页拒收 %s: %s", wb, reason)
 
     return None, "unknown", False, None
 

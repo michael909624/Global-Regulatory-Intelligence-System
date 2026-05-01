@@ -223,13 +223,16 @@ def _enumerate_topics(dim_id: str, quick: bool) -> list[dict]:
 
     try:
         # 议题图不需要联网搜索——它是基于模型先验知识的"应监控面清单"。
-        # 用 call_json 强制结构化输出，t=0.3 保持稳定但不过度收敛。
+        # 用 lite + 关 thinking：本任务是"按业务范围模板填 JSON 议题列表"，
+        # 不需要复杂推理。flash + thinking 此处属于浪费。
         text = ai_client.call_json(
             prompt,
             system=prompts.load("researcher_plan_system").format(
                 business_scope=_BUSINESS_SCOPE,
             ),
             temperature=_PLAN_TEMP,
+            model="gemini-2.5-flash-lite",
+            thinking_budget=0,
         )
         topics = parse_json_array(text) or []
     except Exception as e:
