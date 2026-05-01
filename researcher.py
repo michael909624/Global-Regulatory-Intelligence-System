@@ -55,9 +55,9 @@ DIMENSIONS: dict[str, dict] = {
             {
                 "id": "rd-basic-safety",
                 "name": "基础强制安全标准",
-                "scope_hint": "EN/IEC/UL/GB/JIS 体系下机械、电气、防火、阻燃、EMC、无线、电池、充电安全 全打包。"
-                              "关注新版/修订版标准发布。典型框架:EN 17128/15194、IEC 62133、UL 2271/2272/2849、"
-                              "GB/T 36972/38031、UN 38.3、CISPR 14、FCC Part 15、KC、MIC、RED 委托法规",
+                "scope_hint": "EN/IEC/UL 体系下机械、电气、防火、阻燃、EMC、无线、电池、充电安全 全打包。"
+                              "关注新版/修订版标准发布。"
+                              "典型框架:EN 17128/15194/50604、IEC 62133、UL 2271/2272/2849、RED 委托法规",
             },
             {
                 "id": "rd-cybersecurity",
@@ -255,8 +255,9 @@ _FETCH_TEMPS = (0.2, 1.0)
 _PLAN_TEMP   = 0.3   # AI 发散位:稳定但不过度收敛
 
 # AI 发散位上限。允许 LLM 返回 0(没有真新增议题就不补,反对凑数)。
-# 议题总数 = 静态 18 + 动态 ≤ 5 = 上限 23。
-MAX_DYNAMIC_DISCOVERY = 5
+# 议题总数 = 静态 18 + 动态 ≤ 3 = 上限 42(若 LLM 倾向凑满)。
+# 实测 5 个上限时 LLM 74% 填满率(凑数倾向明显),收紧到 3 限制凑数空间。
+MAX_DYNAMIC_DISCOVERY = 3
 
 # 并发数（保守值；Gemini Flash 限流时会自然降速）
 _PLAN_WORKERS  = 4
