@@ -500,12 +500,12 @@ def _final_sort_key(d):
 
 
 def _filter_and_repaint(rows):
-    """三段式过滤渲染（治本重构后）：
+    """两段式过滤渲染（启发式下放后）：
 
-    Stage 1 机械粗筛（priority.py 工具函数）：
-      • is_noise()       — 单次召回 / 媒体 / 跨主题误命中 → 直接剔除
-      • in_time_window() — 不在 90 天发布 / 12 月生效窗口 → 剔除
-      • affected_products == '不相关' → 剔除（来自 _REPORT_SELECT WHERE 已过滤）
+    Stage 1 时间窗粗筛（priority.in_time_window）：
+      不在 90 天发布 / 12 月生效窗口 → 剔除（datetime.now() 实时锚定）
+      （噪音 / 过程阶段 / 媒体 / 跨主题判定已下放给 LLM 三件套用 few-shot 范本判定,
+        不在本层重复硬编码——见 prompts/llm_triage_system.txt / llm_priority_system.txt）
 
     Stage 2 LLM 终审优先（DB 字段 ai_priority 已写）：
       • ai_priority='P0' + ai_level='L1' → 🔴 进
@@ -521,11 +521,7 @@ def _filter_and_repaint(rows):
 
     scored = []
     for r in rows:
-        # Stage 1：机械粗筛
-        if pri.is_noise(r):
-            continue
-        if pri.is_process_stage(r):
-            continue
+        # Stage 1：时间窗粗筛
         if not pri.in_time_window(r):
             continue
 
