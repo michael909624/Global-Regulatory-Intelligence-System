@@ -15,8 +15,14 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 import authority
+import rules
 from config import REPORTS_DIR
 from database import init_db, get_all_analyses, get_week_analyses, get_manual_followup
+
+# 产品排序优先级:行号即 rank(1 = 最优先);外移到 rules/product_sort_order.txt
+_PRODUCT_RANKS: dict[str, int] = {
+    kw: i for i, kw in enumerate(rules.load_lines("product_sort_order"), 1)
+}
 
 # 与 analyzer/_shared.SYNTHESIS_WARNING 保持一致——避免循环依赖直接复制字符串
 _SYNTHESIS_WARNING = "⚠️ 原文抓取失败，此条目基于 AI 合成，请人工核实后再使用。"
@@ -475,7 +481,7 @@ def _final_sort_key(d):
     """周报最终排序：按用户给定优先级
       第一：重要度（new_impact 重染色后：🔴=L1直接 → 🟡=L2L3间接）
       第二：区域（market_tier：0全球→1欧盟→2欧国→3北美→4美联邦→5美州→6加→7加省→8澳新→99其他）
-      第三：产品（短交通→ebike→电摩→割草机）
+      第三：产品（按 rules/product_sort_order.txt 行序;表外产品 rank=9 排尾）
     """
     impact = d.get("impact_level") or ""
     impact_rank = {"🔴": 1, "🟡": 2, "🟢": 3}.get(impact, 9)
@@ -486,16 +492,7 @@ def _final_sort_key(d):
         market_tier = 99
     market = d.get("affected_markets") or ""
     products = (d.get("affected_products_display") or "").lower()
-    if "短交通" in products:
-        prod_rank = 1
-    elif "ebike" in products:
-        prod_rank = 2
-    elif "电摩" in products:
-        prod_rank = 3
-    elif "割草机" in products:
-        prod_rank = 4
-    else:
-        prod_rank = 9
+    prod_rank = next((r for kw, r in _PRODUCT_RANKS.items() if kw in products), 9)
     return (impact_rank, market_tier, market, prod_rank)
 
 
