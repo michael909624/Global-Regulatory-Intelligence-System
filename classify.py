@@ -1,6 +1,18 @@
 """
 产品分类、市场分级、来源机构识别。
+
+【职责定位】本模块是**字段标准化工具**——把 LLM raw 输出归一化成
+DB 字段(如 "e-bike" → "电助力自行车"、"加州 + 德州" → tier=5)。
+**不是判定逻辑**;请勿与 analyzer/priority.py(时间窗 + 兜底打分)、
+analyzer/llm_priority.py(LLM 终审)混淆——后者负责"这条该不该进周报"
+的业务判定,本模块只负责"这条数据应该写成什么标准格式"。
+
 所有函数为纯函数，无外部 I/O，可独立单测。
+
+【硬编码列表说明】本模块的 _PRODUCT_ALIAS / _EU_SINGLE_CTRY /
+_US_STATE_KW / _CA_PROV_KW / _DOMAIN_MAP 等都属于"业务数据型"列表,
+后续可能外移到 rules/ 目录(rules/market_tiers.txt 已经放占位)。
+当前未外移因为 values.py / backfill.py 多处调用,改动需评估一致性。
 """
 from __future__ import annotations
 

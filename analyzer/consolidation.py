@@ -36,6 +36,7 @@ _log = get_logger("analyzer")
 # 并发参数
 _CONSOLIDATE_WORKERS = 3   # consolidation LLM 调用
 
+# 工程常量(非业务规则);改动需评估对 reg_id 抽取兜底的影响,请勿外移。
 # 法规编号正则（兜底，仅用于从 title 抽编号当 fallback key）
 _REG_NUM_FALLBACK_RE = re.compile(
     r"(?:"
@@ -58,6 +59,7 @@ _CONSOLIDATION_SYSTEM      = prompts.load("consolidation_system").format(
 )
 _CONSOLIDATION_PROMPT_TMPL = prompts.load("consolidation")
 
+# 工程常量(非业务规则);改动需评估对 Pass 2 拒收过度合并的影响,请勿外移。
 # 矛盾措辞检测——LLM 自报"尽管/侧重点不同/分别关注/一项..另一项"等措辞时，
 # reason 本身就承认候选有实质差异，按"维度独立"原则不应合并。
 # 这是 Pass 2 分组放宽（dims 软聚类）后的副作用兜底——LLM 候选范围变大

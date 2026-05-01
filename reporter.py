@@ -401,6 +401,7 @@ def _row_apply_priority(row, new_impact: str):
     return d
 
 
+# 工程常量(非业务规则);美国法案号格式固定(SB/HB/AB),改动需评估对去重 key 的影响,请勿外移。
 _BILL_NUMBER_RE = re.compile(
     r"\b(?:SB|HB|AB|S\.?B\.?|H\.?B\.?|A\.?B\.?|Senate Bill|House Bill|Assembly Bill|Bill)\s*#?\s*(\d{1,5})\b",
     re.IGNORECASE,

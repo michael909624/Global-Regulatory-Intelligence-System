@@ -35,6 +35,7 @@ _LLM_CLUSTER_BATCH       = 40   # 单次 LLM 调用最多比较的候选数
 _LLM_CLUSTER_MIN_GROUP   = 2    # 启动 LLM 的最小候选数
 _JACCARD_PREFILTER_MIN   = 0.25 # token Jaccard 粗筛阈值（< 此值不参与 LLM 比较）
 
+# 工程常量(非业务规则);改动需评估对 Stage 0 LLM 残余聚类粗筛的影响,请勿外移。
 # title 分词停用词——剥离常见法规噪声词后做 Jaccard 粗筛，
 # 避免"Decision/Regulation/Notice"等高频词污染相似度
 _TITLE_STOPWORDS = {

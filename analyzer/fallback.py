@@ -34,6 +34,7 @@ _log = get_logger("analyzer")
 # 并发参数
 _FALLBACK_WORKERS = 5   # 降级合成含 grounded 调用，更慢
 
+# 工程常量(非业务规则);改动需评估对 fallback 启发式过滤的影响,请勿外移。
 # Fallback 启发式：判断一条 scrape 失败的条目是否值得跑 grounded 合成。
 # 分三档过滤掉明显幻觉条目，保留真实法规候选。
 _REGULATORY_KEYWORDS_RE = re.compile(
