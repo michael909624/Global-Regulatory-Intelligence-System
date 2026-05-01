@@ -497,7 +497,7 @@ def _final_sort_key(d):
     return (impact_rank, market_tier, market, prod_rank)
 
 
-def _filter_and_repaint(rows):
+def _filter_and_repaint(rows, *, synth_mode: str = "all"):
     """两段式过滤渲染（启发式下放后）：
 
     Stage 1 时间窗粗筛（priority.in_time_window）：
@@ -513,12 +513,24 @@ def _filter_and_repaint(rows):
     Stage 3 LLM 字段缺失时 → priority.score_fallback 兜底（保守不漏球）
 
     最后：现有 reg_id 去重 + LLM 语义去重 + 排序（不变）
+
+    synth_mode 控制是否含 ⚠️ AI 合成 条目:
+      'all'     — 全部(向后兼容)
+      'exclude' — 跳过合成版(用于信息总览 / 本周更新主表)
+      'only'    — 仅要合成版(用于 ⚠️ AI 合成 sheet)
     """
     from analyzer import priority as pri
     from analyzer.llm_dedup import llm_dedup as _llm_dedup
 
     scored = []
     for r in rows:
+        # 合成 / 真原文 分流(信息总览只看真原文,合成版进独立 sheet)
+        is_synth = bool(r["is_synth"]) if "is_synth" in r.keys() else False
+        if synth_mode == "exclude" and is_synth:
+            continue
+        if synth_mode == "only" and not is_synth:
+            continue
+
         # Stage 1：时间窗粗筛
         if not pri.in_time_window(r):
             continue
@@ -552,14 +564,20 @@ def _filter_and_repaint(rows):
 
 
 def generate_report() -> str:
-    """生成周报：保持原 3 sheet 结构 + 原市场排序 + priority 过滤 NOISE/P2。
+    """生成周报:4 sheet 结构(合成数据已分流)。
 
-    sheet 1 - 信息总览：全部 P0+P1（按 重要度→market_tier→市场→产品 排序）
-    sheet 2 - 本周更新：近 7 天的 P0+P1（同一排序）
-    sheet 3 - 需人工跟进：scraper 抓不到的链接
+    sheet 1 - 信息总览              :全部真原文 P0(按 重要度→market_tier→市场→产品 排序)
+    sheet 2 - 本周更新              :近 7 天的真原文 P0(同一排序)
+    sheet 3 - ⚠️ AI 合成(待人工核实) :所有 ⚠️ Gemini 合成版(原文抓不到的兜底产物,
+                                       impact 强制 ≤🟡;需要人工核实内容真实性)
+    sheet 4 - 需人工跟进            :scraper 抓不到 + 也合成不出的链接(连 fallback 都失败)
 
-    原 impact 语义重定义：🔴=L1 直接合规 / 🟡=L2L3 间接合规（去掉 🟢）。
-    NOISE（单次召回/个案执法）和 P2（< P1 阈值）不进任何 sheet。
+    分流前提:
+      sheet 3 跟 sheet 4 不重叠——sheet 3 = "合成成功但内容是 AI 编的",
+      sheet 4 = "完全没内容,需要你粘贴正文"。两类性质不同,都需要人工干预。
+
+    原 impact 语义:🔴=L1 直接合规 / 🟡=L2L3 间接合规。
+    NOISE(单次召回/个案执法)和 P2(< P1 阈值)不进任何 sheet。
     """
     init_db()
     os.makedirs(REPORTS_DIR, exist_ok=True)
@@ -568,18 +586,25 @@ def generate_report() -> str:
     all_rows  = get_all_analyses()
     week_rows = get_week_analyses(cutoff)
 
-    all_filtered  = _filter_and_repaint(all_rows)
-    week_filtered = _filter_and_repaint(week_rows)
+    # 信息总览/本周更新 = 仅真原文(剔除 ⚠️ AI 合成)
+    all_real     = _filter_and_repaint(all_rows,  synth_mode="exclude")
+    week_real    = _filter_and_repaint(week_rows, synth_mode="exclude")
+    # ⚠️ AI 合成 = 仅合成版(全量,不限近 7 天)
+    all_synth    = _filter_and_repaint(all_rows,  synth_mode="only")
 
     wb  = Workbook()
     ws1 = wb.active
     ws1.title = "信息总览"
-    _fill_sheet(ws1, all_filtered)
+    _fill_sheet(ws1, all_real)
     _fit_sheet(ws1, _MAIN_COL_CAPS)
 
     ws2 = wb.create_sheet("本周更新")
-    _fill_sheet(ws2, week_filtered)
+    _fill_sheet(ws2, week_real)
     _fit_sheet(ws2, _MAIN_COL_CAPS)
+
+    ws3 = wb.create_sheet("⚠️ AI 合成（待人工核实）")
+    _fill_sheet(ws3, all_synth)
+    _fit_sheet(ws3, _MAIN_COL_CAPS)
 
     _sheet_manual(wb)
 
@@ -588,11 +613,13 @@ def generate_report() -> str:
     filepath = os.path.join(REPORTS_DIR, filename)
     wb.save(filepath)
 
-    n_dropped_all = len(all_rows) - len(all_filtered)
-    n_dropped_week = len(week_rows) - len(week_filtered)
-    print(f"报告已生成：{filepath}")
-    print(f"  信息总览    ：{len(all_filtered)} 条（剔除 {n_dropped_all} 条噪音/低优）")
-    print(f"  本周更新    ：{len(week_filtered)} 条（剔除 {n_dropped_week} 条）")
+    n_dropped_all = len(all_rows) - len(all_real) - len(all_synth)
+    n_dropped_week = len(week_rows) - len(week_real)
+    print(f"报告已生成:{filepath}")
+    print(f"  信息总览              :{len(all_real):>4} 条 (仅真原文)")
+    print(f"  本周更新              :{len(week_real):>4} 条 (仅真原文)")
+    print(f"  ⚠️ AI 合成(待核实)    :{len(all_synth):>4} 条 (从主表分流)")
+    print(f"  剔除噪音/低优         :{n_dropped_all:>4} 条")
     return filepath
 
 
