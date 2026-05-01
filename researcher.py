@@ -397,13 +397,15 @@ def _clean_reg_id(raw: str) -> str | None:
 
 
 def _store(reg: dict, sources: list[dict]) -> bool:
-    """保存一条发现到 raw_search_results；按 reg_hash(title) 跨表 30 天去重。"""
+    """保存一条发现到 raw_search_results;按 reg_hash(title) 跨表去重。
+    去重窗口:config.DEDUP_WINDOW_DAYS(默认 90 天,跟用户跑频对齐)。"""
+    from config import DEDUP_WINDOW_DAYS
     title = (reg.get("title_original") or reg.get("title") or "").strip()
     if not title:
         return False
 
     h      = reg_hash(title)
-    cutoff = (datetime.now() - timedelta(days=30)).isoformat()
+    cutoff = (datetime.now() - timedelta(days=DEDUP_WINDOW_DAYS)).isoformat()
 
     with _db_lock:
         with get_connection() as conn:

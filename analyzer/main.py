@@ -85,8 +85,9 @@ def _analyze_one(idx: int, total: int, sc_row) -> str:
         safe_print(f"  [{idx:>3}/{total}] {title[:52]} ✗ 内容为空，跳过")
         return "fail"
 
+    from config import DEDUP_WINDOW_DAYS
     h        = reg_hash(title)
-    cutoff   = (datetime.now() - timedelta(days=30)).isoformat()
+    cutoff   = (datetime.now() - timedelta(days=DEDUP_WINDOW_DAYS)).isoformat()
     is_synth = full_text.startswith("[Gemini synthesis]")
 
     # 同 hash 串行化整段：SELECT existing → LLM → DELETE+INSERT 原子化 → 校验。
