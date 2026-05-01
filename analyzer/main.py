@@ -65,6 +65,102 @@ def _hash_lock(h: str) -> threading.Lock:
         return lk
 
 
+def _check_dedup(h: str, cutoff: str, is_synth: bool):
+    """30 天窗口去重检查。返回:
+      "skip"     —— 同 hash 已分析过且不需替换,调用方应 mark_analyzed + 返回 'dup'
+      None       —— 正常分析,无替换
+      int(ca_id) —— 旧记录是合成版、本次是原文,LLM 成功后用结果替换该条
+
+    例外:旧记录是合成版([Gemini synthesis])但本次是真原文 → 删旧让原文替换,
+    否则真原文永远抢不过早一秒入库的合成版。
+    """
+    with get_connection() as conn:
+        existing = conn.execute("""
+            SELECT ca.id AS ca_id,
+                   sc.full_text AS old_text
+            FROM compliance_analysis ca
+            JOIN scraped_content sc ON sc.id = ca.scraped_id
+            WHERE ca.content_hash=? AND ca.analysis_date>=?
+            ORDER BY ca.id DESC
+            LIMIT 1
+        """, (h, cutoff)).fetchone()
+    if not existing:
+        return None
+    old_is_synth = (existing["old_text"] or "").startswith("[Gemini synthesis]")
+    if old_is_synth and not is_synth:
+        return existing["ca_id"]
+    return "skip"
+
+
+def _llm_and_build(
+    *, title: str, url: str, market: str, relevance: str,
+    full_text: str, is_synth: bool, sc_id: int,
+):
+    """LLM 调用 → JSON 解析 → 字段构造。
+
+    返回 (status, payload):
+      ("ok",        values)   一切顺利,values 是 build_analysis_values 结果
+      ("fail_temp", err_msg)  临时错误(API 限流/网络/SAFETY 屏蔽)→ 不 mark_analyzed
+      ("fail_perm", err_msg)  永久错误(JSON 解析失败/字段构造失败)→ 应 mark_analyzed
+    """
+    if is_synth:
+        tmpl, sys_prompt, extra_biz = FALLBACK_PROMPT_TMPL, FALLBACK_SYSTEM, SYNTHESIS_WARNING
+    else:
+        tmpl, sys_prompt, extra_biz = PROMPT_TMPL, SYSTEM, None
+
+    prompt = tmpl.format(
+        today=datetime.now().strftime("%Y-%m-%d"),
+        title=title or "（未知）",
+        url=url or "（未知）",
+        market=market or "（未知）",
+        relevance=relevance or "（无说明）",
+        scraped_text=full_text,
+        product_list=PRODUCT_LIST,
+    )
+
+    try:
+        # 主分析是按 JSON 模板抽字段,不需要思考链 — 跟 triage/priority/dedup 看齐
+        text = ai_client.call_json(prompt, system=sys_prompt, thinking_budget=0)
+    except Exception as e:
+        _log.error("LLM call FAIL scraped_id=%d: %s", sc_id, e)
+        return ("fail_temp", str(e))
+
+    result = parse_json_object(text)
+    if not result:
+        _log.error("JSON parse fail scraped_id=%d", sc_id)
+        return ("fail_perm", "JSON 解析失败")
+
+    if is_synth:
+        enforce_fallback_caps(result)
+
+    try:
+        values = build_analysis_values(result, title, url, market, extra_biz=extra_biz)
+    except Exception as e:
+        _log.error("build_values FAIL scraped_id=%d: %s", sc_id, e)
+        return ("fail_perm", str(e))
+
+    return ("ok", values)
+
+
+def _persist(sc_id: int, values: dict, h: str, replace_id: int | None) -> bool:
+    """删旧合成版(若有)+ INSERT 新分析 + 校验真写入。
+
+    返回 True 表示成功;False 表示 INSERT OR IGNORE 因 UNIQUE 冲突静默吞,
+    调用方应当 mark_analyzed 防死循环 + 返回 'dup'。
+    """
+    with get_connection() as conn:
+        if replace_id is not None:
+            conn.execute("DELETE FROM compliance_analysis WHERE id=?", (replace_id,))
+            _log.info("REPLACE synth→raw scraped_id=%d ca=%d", sc_id, replace_id)
+        insert_analysis_row(conn, sc_id, values, h)
+        # INSERT OR IGNORE 在 UNIQUE 冲突时静默吞——必须校验真生效,
+        # 否则 mark_analyzed 后这条 sc 就永久"成功但没数据"了。
+        inserted = conn.execute(
+            "SELECT 1 FROM compliance_analysis WHERE scraped_id=?", (sc_id,),
+        ).fetchone()
+    return bool(inserted)
+
+
 def _analyze_one(idx: int, total: int, sc_row) -> str:
     """处理一条 scraped_content；返回 'ok'/'dup'/'fail'。
 
@@ -72,6 +168,13 @@ def _analyze_one(idx: int, total: int, sc_row) -> str:
       • 内容/格式问题（空文本、JSON 解析失败、UNIQUE 冲突静默丢失）→ mark_analyzed
         让它退出待处理队列，避免下次再跑同样会失败的内容
       • 临时错误（API 限流、网络抖动、SAFETY 屏蔽）→ 不 mark_analyzed，下次重跑
+
+    流程拆三段:_check_dedup → _llm_and_build → _persist;主函数纯编排 + print。
+    同 hash 串行化整段:SELECT existing → LLM → DELETE+INSERT → 校验。
+    LLM 调用在锁内看似拖慢,但 sqlite WAL 写本身就是串行的,且同 hash 极少撞,
+    整体并发损失极小,换来的是数据一致性保证。
+    DELETE 旧合成版推迟到 INSERT 同事务里——若 LLM 失败,旧合成版仍保留,
+    不会出现"删了旧的、新的没写成、这条法规归零"的失败模式。
     """
     raw       = get_raw_result(sc_row["raw_id"])
     title     = (raw["title"]      if raw else "") or ""
@@ -90,99 +193,34 @@ def _analyze_one(idx: int, total: int, sc_row) -> str:
     cutoff   = (datetime.now() - timedelta(days=DEDUP_WINDOW_DAYS)).isoformat()
     is_synth = full_text.startswith("[Gemini synthesis]")
 
-    # 同 hash 串行化整段：SELECT existing → LLM → DELETE+INSERT 原子化 → 校验。
-    # LLM 调用在锁内看似拖慢，但 sqlite WAL 写本身就是串行的，且同 hash 极少撞，
-    # 整体并发损失极小，换来的是数据一致性保证。
-    #
-    # 关键：DELETE 旧合成版推迟到 INSERT 同事务里——若 LLM 调用失败，旧合成版仍保留，
-    # 不会出现"删了旧的、新的没写成、这条法规归零"的失败模式。
     with _hash_lock(h):
-        # 30 天去重：同一 title 已分析过则跳过。
-        # 例外：旧记录是合成版（[Gemini synthesis]）但本次是真原文 → 删旧让原文替换。
-        # 否则真原文永远抢不过早一秒入库的合成版（用户想看权威原文反而看不到）。
-        with get_connection() as conn:
-            existing = conn.execute("""
-                SELECT ca.id AS ca_id,
-                       sc.full_text AS old_text
-                FROM compliance_analysis ca
-                JOIN scraped_content sc ON sc.id = ca.scraped_id
-                WHERE ca.content_hash=? AND ca.analysis_date>=?
-                ORDER BY ca.id DESC
-                LIMIT 1
-            """, (h, cutoff)).fetchone()
+        decision = _check_dedup(h, cutoff, is_synth)
+        if decision == "skip":
+            mark_analyzed(sc_row["id"])
+            safe_print(f"  [{idx:>3}/{total}] {title[:52]} → 重复，跳过")
+            return "dup"
+        replace_id: int | None = decision   # None 或 ca_id
+        if replace_id is not None:
+            safe_print(f"  [{idx:>3}/{total}] {title[:52]} ↻ 原文替换旧合成版（待 LLM 成功）")
 
-        replace_existing_id: int | None = None
-        if existing:
-            old_is_synth = (existing["old_text"] or "").startswith("[Gemini synthesis]")
-            if old_is_synth and not is_synth:
-                replace_existing_id = existing["ca_id"]
-                safe_print(f"  [{idx:>3}/{total}] {title[:52]} ↻ 原文替换旧合成版（待 LLM 成功）")
-            else:
-                mark_analyzed(sc_row["id"])
-                safe_print(f"  [{idx:>3}/{total}] {title[:52]} → 重复，跳过")
-                return "dup"
-
-        if is_synth:
-            tmpl, sys_prompt, extra_biz = FALLBACK_PROMPT_TMPL, FALLBACK_SYSTEM, SYNTHESIS_WARNING
-        else:
-            tmpl, sys_prompt, extra_biz = PROMPT_TMPL, SYSTEM, None
-
-        prompt = tmpl.format(
-            today=datetime.now().strftime("%Y-%m-%d"),
-            title=title or "（未知）",
-            url=url or "（未知）",
-            market=market or "（未知）",
-            relevance=relevance or "（无说明）",
-            scraped_text=full_text,
-            product_list=PRODUCT_LIST,
+        status, payload = _llm_and_build(
+            title=title, url=url, market=market, relevance=relevance,
+            full_text=full_text, is_synth=is_synth, sc_id=sc_row["id"],
         )
-
-        try:
-            text = ai_client.call_json(prompt, system=sys_prompt)
-        except Exception as e:
-            # API 错误（限流/网络/SAFETY 屏蔽）属于临时性，不 mark_analyzed，下次重跑
-            _log.error("LLM call FAIL scraped_id=%d: %s", sc_row["id"], e)
-            safe_print(f"  [{idx:>3}/{total}] {title[:52]} ✗ {e}（保留待重试）")
+        if status == "fail_temp":
+            # API 错误属临时性,不 mark_analyzed,下次重跑
+            safe_print(f"  [{idx:>3}/{total}] {title[:52]} ✗ {payload}（保留待重试）")
             return "fail"
-
-        result = parse_json_object(text)
-        if not result:
-            # JSON 格式错误：内容本身就解析不出，重跑大概率仍失败 → mark_analyzed
+        if status == "fail_perm":
+            # JSON / 字段构造错重跑大概率仍失败,mark_analyzed 防死循环
             mark_analyzed(sc_row["id"])
-            _log.error("JSON parse fail scraped_id=%d", sc_row["id"])
-            safe_print(f"  [{idx:>3}/{total}] {title[:52]} ✗ JSON 解析失败")
+            safe_print(f"  [{idx:>3}/{total}] {title[:52]} ✗ {payload}")
             return "fail"
+        values = payload
 
-        if is_synth:
-            enforce_fallback_caps(result)
-
-        try:
-            values = build_analysis_values(result, title, url, market, extra_biz=extra_biz)
-        except Exception as e:
-            # 字段构造失败（极少见，类型转换异常）→ mark_analyzed 防死循环
-            mark_analyzed(sc_row["id"])
-            _log.error("build_values FAIL scraped_id=%d: %s", sc_row["id"], e)
-            safe_print(f"  [{idx:>3}/{total}] {title[:52]} ✗ {e}")
-            return "fail"
-
-        with get_connection() as conn:
-            if replace_existing_id is not None:
-                conn.execute(
-                    "DELETE FROM compliance_analysis WHERE id=?",
-                    (replace_existing_id,),
-                )
-                _log.info("REPLACE synth→raw scraped_id=%d ca=%d title=%s",
-                          sc_row["id"], replace_existing_id, title[:40])
-            insert_analysis_row(conn, sc_row["id"], values, h)
-            # INSERT OR IGNORE 在 UNIQUE 冲突时静默吞——必须校验真生效，
-            # 否则 mark_analyzed 后这条 sc 就永久"成功但没数据"了。
-            inserted = conn.execute(
-                "SELECT 1 FROM compliance_analysis WHERE scraped_id=?",
-                (sc_row["id"],),
-            ).fetchone()
-
+        inserted = _persist(sc_row["id"], values, h, replace_id)
         if not inserted:
-            # 通常意味着同 hash 被另一条抢先写入（虽然有 hash 锁，但跨进程/旧残留也会触发）
+            # 通常意味着同 hash 被另一条抢先写入(虽有 hash 锁,但跨进程/旧残留也会触发)
             _log.warning(
                 "INSERT silently dropped (UNIQUE conflict) scraped_id=%d h=%s",
                 sc_row["id"], h,

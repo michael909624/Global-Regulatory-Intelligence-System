@@ -25,9 +25,8 @@ from collections import defaultdict
 import ai_client
 import authority
 import prompts
-from consolidator import normalize_reg_id
 from database import get_connection
-from utils import get_logger, parse_json_array
+from utils import get_logger, parse_json_array, normalize_reg_id
 
 from ._shared import BUSINESS_SCOPE
 

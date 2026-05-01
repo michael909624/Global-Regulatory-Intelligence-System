@@ -37,6 +37,8 @@ def _purge_synthesized(raw_id: int) -> int:
         if not rows:
             return 0
         sc_ids = [r["id"] for r in rows]
+        if not sc_ids:
+            return 0
         ph = ",".join("?" * len(sc_ids))
         conn.execute(
             f"DELETE FROM compliance_analysis WHERE scraped_id IN ({ph})", sc_ids

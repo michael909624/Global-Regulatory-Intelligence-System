@@ -18,7 +18,7 @@ import time
 from google import genai
 from google.genai import types
 
-from config import GEMINI_API_KEY
+from config import require_api_key
 from utils import get_logger
 
 _log = get_logger("ai_client")
@@ -41,11 +41,13 @@ _client_lock = threading.Lock()
 
 
 def get_client() -> genai.Client:
-    """单例 Gemini client。线程安全。"""
+    """单例 Gemini client。线程安全。
+    第一次调用时校验 API key — 没配置直接报清晰错,而非走到 SDK 报 401。
+    """
     global _client
     with _client_lock:
         if _client is None:
-            _client = genai.Client(api_key=GEMINI_API_KEY)
+            _client = genai.Client(api_key=require_api_key())
     return _client
 
 
@@ -76,8 +78,9 @@ _token_stats: dict = {
     "input_tokens":    0,
     "output_tokens":   0,
     "thoughts_tokens": 0,   # 单独追踪 thinking — 让 print 能展示比例
-    "by_label":        {},  # label → {calls, in, out}
-    "by_model":        {},  # model → {calls, in, out, thoughts, grounded}
+    "cached_tokens":   0,   # implicit cache 命中量 — 让 print 能展示命中率
+    "by_label":        {},  # label → {calls, in, out, cached}
+    "by_model":        {},  # model → {calls, in, out, thoughts, cached, grounded}
 }
 
 
@@ -96,32 +99,36 @@ def _record_tokens(label: str, resp, grounded: bool, model: str = "") -> None:
         in_tok       = getattr(usage, "prompt_token_count", 0) or 0
         cand_tok     = getattr(usage, "candidates_token_count", 0) or 0
         thoughts_tok = getattr(usage, "thoughts_token_count", 0) or 0
+        cached_tok   = getattr(usage, "cached_content_token_count", 0) or 0
         out_tok      = cand_tok + thoughts_tok
         with _token_lock:
             _token_stats["calls"]           += 1
             _token_stats["input_tokens"]    += in_tok
             _token_stats["output_tokens"]   += out_tok
             _token_stats["thoughts_tokens"] += thoughts_tok
+            _token_stats["cached_tokens"]   += cached_tok
             if grounded:
                 _token_stats["grounded_calls"] += 1
             bl = _token_stats["by_label"].setdefault(
-                label, {"calls": 0, "in": 0, "out": 0, "grounded": 0},
+                label, {"calls": 0, "in": 0, "out": 0, "cached": 0, "grounded": 0},
             )
             bl["calls"]    += 1
             bl["in"]       += in_tok
             bl["out"]      += out_tok
+            bl["cached"]   += cached_tok
             bl["grounded"] += 1 if grounded else 0
             mb = _token_stats["by_model"].setdefault(
                 model or "unknown",
-                {"calls": 0, "in": 0, "out": 0, "thoughts": 0, "grounded": 0},
+                {"calls": 0, "in": 0, "out": 0, "thoughts": 0, "cached": 0, "grounded": 0},
             )
             mb["calls"]    += 1
             mb["in"]       += in_tok
             mb["out"]      += out_tok
             mb["thoughts"] += thoughts_tok
+            mb["cached"]   += cached_tok
             mb["grounded"] += 1 if grounded else 0
-        _log.info("TOKENS %-15s model=%s in=%d out=%d (cand=%d think=%d) grounded=%s",
-                  label, model or "?", in_tok, out_tok, cand_tok, thoughts_tok, grounded)
+        _log.info("TOKENS %-15s model=%s in=%d (cached=%d) out=%d (cand=%d think=%d) grounded=%s",
+                  label, model or "?", in_tok, cached_tok, out_tok, cand_tok, thoughts_tok, grounded)
     except Exception as e:
         _log.warning("token tracking failed (%s): %s", label, e)
 
@@ -130,12 +137,14 @@ def get_token_stats() -> dict:
     """返回累计 token 快照（深拷贝）。"""
     with _token_lock:
         return {
-            "calls":          _token_stats["calls"],
-            "grounded_calls": _token_stats["grounded_calls"],
-            "input_tokens":   _token_stats["input_tokens"],
-            "output_tokens":  _token_stats["output_tokens"],
-            "by_label":       {k: dict(v) for k, v in _token_stats["by_label"].items()},
-            "by_model":       {k: dict(v) for k, v in _token_stats["by_model"].items()},
+            "calls":           _token_stats["calls"],
+            "grounded_calls":  _token_stats["grounded_calls"],
+            "input_tokens":    _token_stats["input_tokens"],
+            "output_tokens":   _token_stats["output_tokens"],
+            "thoughts_tokens": _token_stats["thoughts_tokens"],
+            "cached_tokens":   _token_stats["cached_tokens"],
+            "by_label":        {k: dict(v) for k, v in _token_stats["by_label"].items()},
+            "by_model":        {k: dict(v) for k, v in _token_stats["by_model"].items()},
         }
 
 
@@ -147,6 +156,7 @@ def reset_token_stats() -> None:
         _token_stats["input_tokens"]    = 0
         _token_stats["output_tokens"]   = 0
         _token_stats["thoughts_tokens"] = 0
+        _token_stats["cached_tokens"]   = 0
         _token_stats["by_label"].clear()
         _token_stats["by_model"].clear()
 
@@ -203,6 +213,7 @@ def print_token_summary(prefix: str = "") -> None:
     # 同时显示 thinking 占比 — 帮用户识别"哪些调用 thinking 占比高 = 浪费"
     total_cost = 0.0
     total_thoughts = s.get("thoughts_tokens", 0)
+    total_cached   = s.get("cached_tokens", 0)
     print(f"\n  按模型计费：")
     for model, bm in sorted(s["by_model"].items(), key=lambda x: -x[1]["in"] - x[1]["out"]):
         in_p, out_p = _price_for_model(model)
@@ -213,13 +224,23 @@ def print_token_summary(prefix: str = "") -> None:
         cand = bm["out"] - thoughts
         ratio = (thoughts / bm["out"] * 100) if bm["out"] > 0 else 0
         think_tag = f" [thinking {thoughts:,}/{bm['out']:,} = {ratio:.0f}%]" if thoughts else ""
+        cached = bm.get("cached", 0)
+        cache_ratio = (cached / bm["in"] * 100) if bm["in"] > 0 else 0
+        cache_tag = f" [cached {cached:,}/{bm['in']:,} = {cache_ratio:.0f}%]" if cached else ""
         print(f"    {model:<35} calls={bm['calls']:<4} "
-              f"in={bm['in']:>8,}×${in_p}=${in_c:.3f}  "
+              f"in={bm['in']:>8,}×${in_p}=${in_c:.3f}{cache_tag}  "
               f"out={bm['out']:>8,}×${out_p}=${out_c:.3f}{think_tag}")
     if total_thoughts > 0:
         print(f"\n  💡 thinking tokens 总计 {total_thoughts:,}（占输出 "
               f"{total_thoughts / s['output_tokens'] * 100:.0f}%）— "
               f"对结构化模板填/简单事实查询场景可设 thinking_budget=0 节省")
+    if total_cached > 0:
+        cache_pct = total_cached / s['input_tokens'] * 100 if s['input_tokens'] else 0
+        print(f"\n  💾 implicit cache 命中:{total_cached:,} tokens（占输入 "
+              f"{cache_pct:.0f}%）— Gemini 自动复用静态前缀,无需手动启用")
+    elif s['input_tokens'] > 1024:
+        print(f"\n  💾 implicit cache 命中 0 — 静态前缀可能 < 1024 tokens 或前缀不一致,"
+              f"可考虑显式 cache_content")
 
     paid_grounded = max(0, s["grounded_calls"] - GROUNDING_FREE_RPD)
     g_cost = paid_grounded / 1000 * GROUNDING_PRICE_PER_K

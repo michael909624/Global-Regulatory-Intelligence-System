@@ -190,7 +190,8 @@ def _fallback_one(idx: int, total: int, row) -> str:
     )
 
     try:
-        text   = ai_client.call_json(prompt, system=FALLBACK_SYSTEM)
+        # 与主分析一致,关 thinking — 合成路径同样是 JSON 模板填充任务
+        text   = ai_client.call_json(prompt, system=FALLBACK_SYSTEM, thinking_budget=0)
         result = parse_json_object(text)
         if not result:
             _mark_manual(row["id"])

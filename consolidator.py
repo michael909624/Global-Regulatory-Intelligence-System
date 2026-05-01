@@ -26,7 +26,7 @@ import authority
 import prompts
 import rules
 from database import get_connection
-from utils import get_logger, parse_json_array
+from utils import get_logger, parse_json_array, normalize_reg_id
 
 _log = get_logger("consolidator")
 
@@ -68,110 +68,9 @@ def _is_navigation_title(title: str | None) -> bool:
 
 
 # ── reg_id 归一化 ──────────────────────────────────────────────────────────────
-#
-# 把模型自报的多种写法折叠到统一的聚类键。例：
-#   "(EU) 2024/2847"             → "EU/2024/2847"
-#   "Regulation (EU) 2024/2847"  → "EU/2024/2847"
-#   "32024R2847" (CELEX)         → "EU/2024/2847"     ← 跨格式合并
-#   "GB 17761"                   → "GB/17761"
-#   "16 CFR Part 1273"           → "CFR/16-1273"
-#   "UN R155"                    → "UN/R155"
-#   "CRA" / "Cyber Resilience Act" → "ALIAS/CRA"
-#
-# 保守原则：只折叠"明确同一编号的不同写法"。"CRA" 与 "EU/2024/2847"
-# 在 Stage 0 视作不同组（两者通过 ALIAS/EU 路径独立归一） —— 跨家族合并交给 Stage 3。
-
-# 别名映射(PSTI / RoHS / REACH / IATA / 危险品运输 ...)外移到 rules/reg_aliases.txt
-_ALIAS_MAP = rules.load_pairs("reg_aliases")
-
-# ALIAS → CELEX 反向映射：让别名条目（"CRA"、"AI Act"、"Battery Regulation"）
-# 和 CELEX 条目（EU/2024/2847）落到同一聚类 key，根治"同一法规 5 个 reg_id"
-# 漏合并问题。优先级高于 _ALIAS_MAP（在 normalize_reg_id 里先匹配）。
-# 法规清单外移到 rules/reg_alias_to_celex.txt——业务同事可直接加新法规。
-_ALIAS_TO_CELEX = rules.load_pairs("reg_alias_to_celex")
-
-_STD_PREFIXES = ("EN", "IEC", "UL", "ISO", "JIS", "AS/NZS", "AIS", "ANSI", "CSA", "BS")
-
-
-def normalize_reg_id(raw: str | None) -> str | None:
-    """归一化模型自报的 reg_id 到聚类键；返回 None 表示无法归类。
-
-    设计：先尝试抽 CELEX / EU 编号（强信号），命中即归一。这样
-    "32024R2847" / "32024R2847 Deadlines" / "32024R2847_Guidance"
-    都归到同一 EU/2024/2847；CRA / AI Act 等已知别名也通过
-    _ALIAS_TO_CELEX 反向映射到对应 CELEX。
-    """
-    if not raw:
-        return None
-    s = raw.strip()
-    if not s:
-        return None
-    # 下划线在 \b 视角是 word char，会破坏词边界检测
-    # （"CRA_Guidance" 里 \bCRA\b 不命中）。先转成空格再做正则。
-    upper = s.upper().replace("_", " ")
-
-    # CELEX → EU/YYYY/NNN（用 search 而非 match：含后缀/前缀的字符串也能抽出）
-    # 支持 4 位或 5 位顺序号：32024R2847 / 32023R1542 / 32024R0900
-    m = re.search(r"\b3(\d{4})[RLDC](\d{1,5})\b", upper)
-    if m:
-        return f"EU/{m.group(1)}/{int(m.group(2))}"
-
-    # (EU) YYYY/NNN  /  Reg YYYY/NNN  /  Directive YYYY/NNN
-    m = re.search(r"\(EU\)\s*(\d{4})/(\d+)", upper)
-    if m:
-        return f"EU/{m.group(1)}/{int(m.group(2))}"
-    m = re.search(
-        r"\b(?:REG|REGULATION|DIRECTIVE|DECISION|DELEGATED|IMPLEMENTING)"
-        r"[A-Z\s\(\)]*?(\d{4})/(\d+)",
-        upper,
-    )
-    if m:
-        return f"EU/{m.group(1)}/{int(m.group(2))}"
-
-    # 别名优先映射到对应 CELEX（让 "CRA" / "AI Act" 等条目和 CELEX 条目同组）
-    for pat, celex_key in _ALIAS_TO_CELEX:
-        if re.search(pat, upper):
-            return celex_key
-
-    # 美国 CFR
-    m = re.search(r"\b(\d{1,3})\s*CFR\s*(?:PART\s*)?(\d+)", upper)
-    if m:
-        return f"CFR/{m.group(1)}-{m.group(2)}"
-    m = re.search(r"\bCFR\s*PART\s*(\d+)", upper)
-    if m:
-        return f"CFR/0-{m.group(1)}"
-
-    # 中国 GB / GB/T
-    m = re.search(r"\bGB[/\s\-]?T?[\s\-]?(\d{4,6})", upper)
-    if m:
-        return f"GB/{m.group(1)}"
-
-    # UN / UNECE Regulation
-    m = re.search(
-        r"\bUN\s*(?:ECE\s*)?R(?:EGULATION)?\s*(?:NO\.?)?\s*(\d+)",
-        upper,
-    )
-    if m:
-        return f"UN/R{m.group(1)}"
-
-    # 国际标准（EN / IEC / UL / ISO / JIS / AS/NZS / AIS / ANSI / CSA / BS）
-    for prefix in _STD_PREFIXES:
-        pat = re.compile(rf"\b{re.escape(prefix)}[/\s\-]?(\d{{3,6}})", re.I)
-        m = pat.search(upper)
-        if m:
-            key_prefix = prefix.upper().replace("/", "_")
-            return f"{key_prefix}/{m.group(1)}"
-
-    # 别名（CRA / AI Act / Battery Regulation / PSTI / RoHS / REACH / GDPR）
-    for pat, alias in _ALIAS_MAP:
-        if re.search(pat, upper):
-            return f"ALIAS/{alias}"
-
-    # 兜底：原值压缩作为弱聚类键（保留模型独有的奇怪编号）
-    fallback = re.sub(r"[^\w\d/\-]", "", s.lower())
-    if len(fallback) >= 4:
-        return f"RAW/{fallback[:50]}"
-    return None
+# normalize_reg_id 已搬到 utils.py(纯字符串处理函数,reporter / analyzer.consolidation
+# 都需要,放在 utils 解除三角依赖)。本模块在文件顶部已 from utils import 它。
+# 别名映射 _ALIAS_MAP / _ALIAS_TO_CELEX 也随函数一起搬走,见 utils.py:_load_regid_rules。
 
 
 # ── LLM 语义聚类（reg_id 正则失效时的兜底）────────────────────────────────────

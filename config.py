@@ -7,6 +7,20 @@ try:
 except ImportError:
     GEMINI_API_KEY = _os.environ.get("GEMINI_API_KEY", "")
 
+
+def require_api_key() -> str:
+    """读取 API key,空时给清晰提示。LLM 调用前应调一次。
+    比让 SDK 报 401 更早暴露配置问题——避免用户跑半小时后才发现 key 没配。
+    """
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY 未配置。请在以下任一位置设置:\n"
+            "  1. 项目根目录创建 config_local.py,内容:GEMINI_API_KEY = \"AIza...\"\n"
+            "  2. 或设置环境变量:export GEMINI_API_KEY=\"AIza...\"\n"
+            "申请地址:https://aistudio.google.com/apikey"
+        )
+    return GEMINI_API_KEY
+
 # Database
 DATABASE_PATH = _os.path.join(_BASE, "data", "gris.db")
 

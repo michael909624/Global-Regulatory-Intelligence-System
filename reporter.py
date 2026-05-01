@@ -419,7 +419,7 @@ def _composite_dedup_key(row):
          机动车管理条例》将于5月1日正式施行" / "《北京市非机动车管理条例》修订版实施"）
          → key="中国 (北京)|北京市非机动车管理条例"
     """
-    from consolidator import normalize_reg_id
+    from utils import normalize_reg_id
     try:
         reg_id = row["reg_id"]
     except (IndexError, KeyError):
