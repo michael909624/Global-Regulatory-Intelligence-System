@@ -36,6 +36,11 @@ HELP = """
                       view 低       只看低影响（🟢）
                       view 高 50    高影响，最多 50 条
 
+  view_dropped      看 triage 预筛 drop 的 raw 清单（防误杀真法规）
+                      view_dropped              最近 30 条
+                      view_dropped 100          最近 100 条
+                      view_dropped --pursue 42  把 id=42 标 pursue 恢复
+
   status            显示数据库统计概览
 
   backfill          为缺失 source_url 的历史条目调用 Gemini 补全官方链接
@@ -381,6 +386,88 @@ def cmd_view(args: list[str]):
         print("─" * 72)
 
 
+def cmd_view_dropped(args: list[str]):
+    """查看 triage 预筛标 drop 的 raw 清单(防误杀真法规)。
+
+    用法:
+      view_dropped              最近 30 条
+      view_dropped 100          最近 100 条
+      view_dropped --pursue 42  把 id=42 重新标 pursue,让它进 scrape 队列
+    """
+    from database import get_connection, init_db
+
+    init_db()
+
+    # ── 子命令:--pursue <id> 误杀恢复 ──────────────────────────────────────
+    if "--pursue" in args:
+        idx = args.index("--pursue")
+        if idx + 1 >= len(args):
+            print("用法:view_dropped --pursue <id>")
+            return
+        try:
+            rid = int(args[idx + 1])
+        except ValueError:
+            print(f"id 必须是整数,得到 {args[idx + 1]!r}")
+            return
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT id, title, triage_decision FROM raw_search_results WHERE id=?",
+                (rid,),
+            ).fetchone()
+            if not row:
+                print(f"找不到 id={rid} 的条目")
+                return
+            if row["triage_decision"] != "drop":
+                print(f"id={rid} 当前不是 drop(={row['triage_decision']!r}),无需恢复")
+                return
+            conn.execute(
+                "UPDATE raw_search_results SET triage_decision='pursue', "
+                "triage_reason='[人工恢复]' WHERE id=?",
+                (rid,),
+            )
+            print(f"已将 id={rid} \"{(row['title'] or '')[:40]}\" 标为 pursue,下次 scrape 会处理。")
+        return
+
+    # ── 默认:列最近 N 条 drop ───────────────────────────────────────────────
+    limit = 30
+    for a in args:
+        if a.isdigit():
+            limit = int(a)
+
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT id, title, market, reg_id, triage_reason, query_date
+            FROM raw_search_results
+            WHERE triage_decision = 'drop'
+            ORDER BY id DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        total_drops = conn.execute(
+            "SELECT COUNT(*) FROM raw_search_results WHERE triage_decision = 'drop'"
+        ).fetchone()[0]
+
+    if not rows:
+        print("没有被 triage 预筛 drop 的条目。")
+        return
+
+    print(f"\n最近 {len(rows)}/{total_drops} 条 triage 预筛 drop 的 raw:\n")
+    print("─" * 80)
+    for r in rows:
+        title  = (r["title"] or "无标题")[:60]
+        market = (r["market"] or "?")[:20]
+        reg_id = (r["reg_id"] or "—")[:30]
+        reason = (r["triage_reason"] or "")[:80]
+        date   = (r["query_date"] or "")[:10]
+
+        print(f"  [id={r['id']:>5}] [{market}] {title}")
+        print(f"           reg_id={reg_id}  ({date})")
+        print(f"           理由:{reason}")
+        print("─" * 80)
+
+    print(f"\n  共 {total_drops} 条 drop。若发现误杀,运行:")
+    print(f"     python gris.py view_dropped --pursue <id>")
+
+
 def cmd_retry(_args: list[str]):
     from database import get_connection, init_db, delete_orphan_scraped
 
@@ -563,6 +650,7 @@ _MENU: list[tuple[str, str] | None] = [
     ("report",   "生成 Excel 周报（保存至 reports/）"),
     None,
     ("view",     "终端查看分析结果  附加参数：高/中/低  [条数，默认20]"),
+    ("view_dropped", "看 triage drop 清单(防误杀)  --pursue <id> 恢复"),
     ("status",   "数据库统计概览"),
     ("backfill", "补全缺失的来源 URL（Gemini 逐条查找官方链接）"),
     ("manual",   "人工补录：粘贴抓取失败页面正文"),
@@ -652,8 +740,9 @@ COMMANDS = {
     "analyze":     cmd_analyze,
     "judge":       cmd_judge,
     "report":      cmd_report,
-    "view":        cmd_view,
-    "status":      cmd_status,
+    "view":         cmd_view,
+    "view_dropped": cmd_view_dropped,
+    "status":       cmd_status,
     "manual":      cmd_manual,
     "retry":       cmd_retry,
     "clean":       cmd_clean,
