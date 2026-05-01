@@ -318,7 +318,7 @@ class BlockedResponseError(RuntimeError):
 def _check_finish_reason(resp, label: str) -> None:
     """resp.text 为空时检查 finish_reason；非 STOP 则视为被屏蔽，抛错。
     SDK 在 SAFETY/RECITATION/MAX_TOKENS 时 text 都是 None——不区分会让被屏蔽的法规
-    悄悄变成"信息不足→🟢"入库，污染合规情报。
+    悄悄变成"信息不足→低置信猜测"入库，污染合规情报。
     """
     fr_str = ""
     try:

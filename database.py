@@ -17,7 +17,7 @@ from datetime import datetime
 from config import DATABASE_PATH
 from utils import get_logger
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 _log = get_logger("database")
 
 
@@ -99,7 +99,7 @@ _DDL_LATEST = """
         compliance_deadline         TEXT,
         key_dates                   TEXT,
         action_items                TEXT,
-        impact_level                TEXT CHECK(impact_level IN ('🔴','🟡','🟢')),
+        impact_level                TEXT CHECK(impact_level IN ('🔴','🟡')),
         affected_products           TEXT,
         affected_products_display   TEXT,
         affected_markets            TEXT,
@@ -171,6 +171,8 @@ def _bootstrap_or_migrate(conn: sqlite3.Connection) -> None:
         _migrate_to_v9(conn)
     if cur_v < 10:
         _migrate_to_v10(conn)
+    if cur_v < 11:
+        _migrate_to_v11(conn)
 
     conn.execute("DELETE FROM schema_version")
     conn.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
@@ -288,6 +290,28 @@ def _migrate_to_v10(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {type_}")
             except sqlite3.OperationalError as e:
                 _log.warning("ADD COLUMN %s.%s skipped: %s", table, col, e)
+
+
+def _migrate_to_v11(conn: sqlite3.Connection) -> None:
+    """v10→v11:重要度从三档(🔴🟡🟢)缩减为两档(🔴🟡),业务模型简化。
+
+    用户业务本质二元:
+      🔴 = 影响产品研发设计/生产/市场准入(产品本身能否上市)
+      🟡 = 影响用户使用/销量/间接盈利(已上市产品能否卖好)
+    中间档 🟢 徒增噪音(实测表现是 LLM 在两档外蒙混的"凑数等级")。
+
+    迁移动作:把现存 🟢 全部升级为 🟡(保守不漏球;若是真低优,后续 LLM
+    终审会判 drop;若是误判,至少不会丢失)。CHECK 约束放宽到 IN ('🔴','🟡')。
+
+    注:SQLite 改 CHECK 需重建表,旧约束 IN ('🔴','🟡','🟢') 仍允许 🟢
+    但代码层(analyzer/_shared.VALID_IMPORTANCE / 各 prompt)已限制不再产生,
+    故本迁移仅做数据 UPDATE,不重建表(避免历史 schema 双重重建复杂度)。
+    """
+    n = conn.execute(
+        "UPDATE compliance_analysis SET impact_level='🟡' WHERE impact_level='🟢'"
+    ).rowcount or 0
+    if n:
+        _log.info("v11 迁移:%d 条 🟢 升级为 🟡(重要度缩减为两档)", n)
 
 
 def _migrate_importance_emoji(conn: sqlite3.Connection) -> None:
@@ -493,12 +517,12 @@ _REPORT_SELECT = """
       AND COALESCE(ca.affected_products_display, ca.affected_products) IS NOT NULL
       AND COALESCE(ca.affected_products_display, ca.affected_products) != ''
       AND rs.consolidated_into IS NULL
-      -- 低置信过滤：LLM 自报"零业务维度 + 🟢 影响"= 它自己都不确定，
-      -- 通常是被标题关键词诱导后的"合理推断"猜测。这种条目对用户是噪音，
-      -- 让真正高置信的（≥1 维度 OR ≥🟡 影响）才进周报。
-      -- 设计前提：真业务相关法规至少能识别出一个 L3 维度，否则就是误判。
+      -- 低置信过滤(v11):重要度缩为两档后,"零业务维度 + 🟡" 是新的低置信信号——
+      -- 按业务定义 🟡 = 销量/运营影响,必然触及至少一个 L3 维度(USE/RETAIL/EOL...)。
+      -- LLM 给 🟡 但说零 dim = 它自己矛盾 = 被标题诱导的低置信猜测,过滤掉。
+      -- 🔴 留宽容:产品准入级别即使 dim 抽取失败也保留(避免漏球)。
       AND NOT (
-          ca.impact_level = '🟢'
+          ca.impact_level = '🟡'
           AND (
               ca.business_dimensions IS NULL
               OR TRIM(ca.business_dimensions) = ''
@@ -509,8 +533,8 @@ _REPORT_SELECT = """
 
 _REPORT_ORDER = """
     ORDER BY
-        -- 第一优先：重要度（🔴 → 🟡 → 🟢）
-        CASE ca.impact_level WHEN '🔴' THEN 1 WHEN '🟡' THEN 2 WHEN '🟢' THEN 3 ELSE 9 END,
+        -- 第一优先:重要度(🔴 → 🟡;🟢 已废弃)
+        CASE ca.impact_level WHEN '🔴' THEN 1 WHEN '🟡' THEN 2 ELSE 9 END,
         -- 第二优先：区域（0 全球 / 1 欧盟 / 2 欧国 / 3 北美 / 4 美联邦 ...）
         COALESCE(ca.market_tier, 99),
         COALESCE(ca.affected_markets, ''),

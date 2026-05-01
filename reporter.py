@@ -176,13 +176,13 @@ def _fmt_source(source_institution: str | None, source_language: str | None,
 
 # ── 样式 ──────────────────────────────────────────────────────────────────────
 
+# 业务模型只有两档:🔴 产品准入合规 / 🟡 销量与运营影响。🟢 已废弃。
 # (badge_bg, badge_fg, row_light, row_dark)
 _IMPACT_PALETTE = {
     "🔴": ("C0392B", "FFFFFF", "FDECEA", "FAD7D4"),
     "🟡": ("D4820A", "FFFFFF", "FEF9E7", "FDEAB7"),
-    "🟢": ("1E8449", "FFFFFF", "EAFAF1", "D5F5E3"),
 }
-_BADGE_TEXT = {"🔴": "🔴", "🟡": "🟡", "🟢": "🟢"}
+_BADGE_TEXT = {"🔴": "🔴", "🟡": "🟡"}
 
 _HEADER_FILL = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
 _HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
@@ -252,7 +252,7 @@ def _fill_sheet(ws, rows) -> None:
     group_parity: dict = {}
 
     for row in rows:
-        impact             = row["impact_level"] or "🟢"
+        impact             = row["impact_level"] or "🟡"   # 默认值用 🟡(🟢 已废弃)
         title_orig         = row["title"] or ""
         title_cn           = row["title_cn"] or ""
         requirement        = row["compliance_requirement"] or ""
@@ -485,7 +485,7 @@ def _final_sort_key(d):
       第三：产品（按 rules/product_sort_order.txt 行序;表外产品 rank=9 排尾）
     """
     impact = d.get("impact_level") or ""
-    impact_rank = {"🔴": 1, "🟡": 2, "🟢": 3}.get(impact, 9)
+    impact_rank = {"🔴": 1, "🟡": 2}.get(impact, 9)   # 🟢 已废弃
     try:
         mt = d.get("market_tier")
         market_tier = int(mt) if mt is not None else 99

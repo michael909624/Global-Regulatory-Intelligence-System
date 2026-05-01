@@ -31,9 +31,8 @@ HELP = """
 ━━━  辅助工具  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   view              终端查看最近分析结果（默认 20 条）
-                      view 高       只看高影响（🔴）
-                      view 中       只看中影响（🟡）
-                      view 低       只看低影响（🟢）
+                      view 高       只看高影响（🔴 产品准入）
+                      view 中       只看次要（🟡 销量影响）
                       view 高 50    高影响，最多 50 条
 
   view_dropped      看 triage 预筛 drop 的 raw 清单（防误杀真法规）
@@ -317,8 +316,8 @@ def cmd_view(args: list[str]):
 
     init_db()
 
-    _IMPACT_MAP = {"高": "🔴", "中": "🟡", "低": "🟢"}
-    _IMPACT_TAG = {"🔴": "🔴高", "🟡": "🟡中", "🟢": "🟢低"}
+    _IMPACT_MAP = {"高": "🔴", "中": "🟡"}   # 🟢 已废弃
+    _IMPACT_TAG = {"🔴": "🔴高", "🟡": "🟡中"}
 
     impact_filter = None
     limit = 20
@@ -364,7 +363,7 @@ def cmd_view(args: list[str]):
         print(f"没有{label}分析记录。")
         return
 
-    label_map = {"🔴": "高", "🟡": "中", "🟢": "低"}
+    label_map = {"🔴": "高", "🟡": "中"}
     label = f"（仅限{label_map.get(impact_filter, impact_filter)}影响）" if impact_filter else ""
     print(f"\n最近 {len(rows)} 条分析结果{label}：\n")
     print("─" * 72)
@@ -563,7 +562,6 @@ def cmd_status(_args: list[str]):
         analyzed    = conn.execute("SELECT COUNT(*) FROM compliance_analysis").fetchone()[0]
         high_impact = conn.execute("SELECT COUNT(*) FROM compliance_analysis WHERE impact_level='🔴'").fetchone()[0]
         mid_impact  = conn.execute("SELECT COUNT(*) FROM compliance_analysis WHERE impact_level='🟡'").fetchone()[0]
-        low_impact  = conn.execute("SELECT COUNT(*) FROM compliance_analysis WHERE impact_level='🟢'").fetchone()[0]
 
     print()
     print("━━━  数据库概览  ━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -575,10 +573,9 @@ def cmd_status(_args: list[str]):
     print(f"    └ 需人工补录   {manual:>5} 条")
     print()
     print(f"  AI 分析结果     {analyzed:>5} 条")
-    print(f"    ├ 🔴 高影响    {high_impact:>5} 条  ({high_impact/analyzed*100:.0f}%)" if analyzed else
-          f"    ├ 🔴 高影响        0 条")
-    print(f"    ├ 🟡 中影响    {mid_impact:>5} 条")
-    print(f"    └ 🟢 低影响    {low_impact:>5} 条")
+    print(f"    ├ 🔴 重要(产品准入)  {high_impact:>5} 条  ({high_impact/analyzed*100:.0f}%)" if analyzed else
+          f"    ├ 🔴 重要(产品准入)      0 条")
+    print(f"    └ 🟡 次要(销量影响)  {mid_impact:>5} 条")
     print()
 
 

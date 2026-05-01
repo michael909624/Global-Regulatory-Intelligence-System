@@ -66,7 +66,7 @@ def strip_injection_markers(text: str) -> str:
 
 
 # ── 业务枚举 ──────────────────────────────────────────────────────────────────
-VALID_IMPORTANCE = {"🔴", "🟡", "🟢"}
+VALID_IMPORTANCE = {"🔴", "🟡"}   # 🟢 已废弃,业务模型本质二元(产品准入 vs 销量影响)
 PRODUCT_LIST     = "、".join(PRODUCT_LINES)
 
 # 八维 L3 业务影响枚举（与 business_scope.txt 一致）

@@ -9,7 +9,7 @@ Seeds — 高权威源种子库。
     (例:federalregister 搜索 URL、CPSC Recalls 列表、SAMR 法规库索引)
   • 种子 *不参与* scrape → analyze 流水线 — 入库时 priority='种子'、
     scrape_status='已抓取',scraper 与 analyzer 都会跳过它们,不会出现在
-    Excel 周报里(否则索引页会被分析成"信息不足 → 🟢"污染报告)。
+    Excel 周报里(否则索引页会被分析成"信息不足 → 不相关"污染报告)。
   • 种子的真正用途:
       1. 占位去重 — researcher 之后若发现同 title hash 直接跳过,避免
          AI 又把这些入口页当作"新发现"重复入库
@@ -156,7 +156,7 @@ SEEDS: list[dict] = [
 def _purge_legacy_seed_artifacts(conn, raw_id: int) -> int:
     """清理旧版本遗留:同一种子 raw_id 关联的 scraped_content + compliance_analysis。
 
-    早期种子会进入 scrape→analyze 管线,产生"信息不足→🟢"的无意义分析。
+    早期种子会进入 scrape→analyze 管线,产生"信息不足→不相关"的无意义分析。
     新版本种子不再走分析,需要把历史污染数据回收掉。
     返回删除的 scraped_content 行数。
     """

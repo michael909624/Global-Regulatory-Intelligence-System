@@ -22,7 +22,7 @@
     "consultation_close": "YYYY-MM-DD 或 null"
   }},
   "deadline":            "YYYY-MM-DD 或 null",
-  "importance":          "🟡 或 🟢",
+  "importance":          "🟡（合成版上限,不可填 🔴；🟢 已废弃）",
   "importance_note":     "「阶段N + CX → 档位」",
   "worst_case":          "字符串；合成资料未提及时填「待确认」",
   "business_impact":     "对我司影响要点（仅基于合成资料明确提及的信息）",
