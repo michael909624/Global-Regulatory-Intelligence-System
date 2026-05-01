@@ -39,89 +39,166 @@ UPCOMING_DEADLINE_DAYS = 365   # Track B：未来 365 天即将生效
 _AUDIT_WINDOW_MULTIPLIER = 2
 
 # ── 八维议题图（与 business_scope L3 完全对齐）──────────────────────────────
-# Plan 按这八个 L3 维度分别枚举议题。
-# L2（售前/售中/售后）由 reporter 端从 L3 派生，无需模型处理。
+# Plan 阶段:静态全集 18 个议题(下方 DIMENSIONS.static_topics) + AI 最多补 5 个新兴议题
+# = 总数上限 23,允许 LLM 返回 0(允许空、反对凑数)。
+# L2(售前/售中/售后)由 reporter 端从 L3 派生,无需模型处理。
+#
+# 议题颗粒度原则:
+#   新法规高频更新     → 单列    (CRA、AI Act、DPP、充电消防)
+#   老法规低频更新     → 打包    (基础安全标准、危险品运输)
+#   跨多法域成熟体系   → 打包    (召回执法、EPR)
 DIMENSIONS: dict[str, dict] = {
     # ── 售前 ───────────────────────────────────────────────────────────
     "RD": {
         "name": "RD 产品研发设计",
-        "subtopics": [
-            "机械 / 电气 / 防火 / 阻燃 标准（EN / IEC / UL / JIS / GB）",
-            "电池技术规范：IEC 62133、UL 2271/2272/2849、UN 38.3、GB/T 36972/38031、EN 50604",
-            "充电安全 / 接口 / 通信协议：USB-C 通用充电器、智能充电 / V2G 互操作",
-            "AI 与自动驾驶 / 功能安全：EU AI Act 实施细则、ISO 25119、IEC 61508、ISO 26262",
-            "网络安全 / 软件 / OTA：EU CRA、UK PSTI、UN R155 / R156、NIST IoT、ETSI EN 303 645",
-            "无线 / EMC / 频谱：EU RED 委托法规、FCC Part 15、日本 MIC、韩国 KCC、CISPR 14",
+        "static_topics": [
+            {
+                "id": "rd-basic-safety",
+                "name": "基础强制安全标准",
+                "scope_hint": "EN/IEC/UL/GB/JIS 体系下机械、电气、防火、阻燃、EMC、无线、电池、充电安全 全打包。"
+                              "关注新版/修订版标准发布。典型框架:EN 17128/15194、IEC 62133、UL 2271/2272/2849、"
+                              "GB/T 36972/38031、UN 38.3、CISPR 14、FCC Part 15、KC、MIC、RED 委托法规",
+            },
+            {
+                "id": "rd-cybersecurity",
+                "name": "网络安全 / 软件 / OTA",
+                "scope_hint": "联网消费品的网络安全义务、软件更新、OTA 强制要求、SBOM 披露。"
+                              "典型框架:EU CRA、UK PSTI、UN R155/R156、NIST IoT、ETSI EN 303 645",
+            },
+            {
+                "id": "rd-ai-functional-safety",
+                "name": "AI / 自动驾驶 / 功能安全",
+                "scope_hint": "AI 系统、自动驾驶、功能安全设计要求。"
+                              "典型框架:EU AI Act 实施细则、ISO 26262、IEC 61508、ISO 25119、SOTIF",
+            },
         ],
     },
     "PROD": {
         "name": "PROD 生产 / 供应链",
-        "subtopics": [
-            "物质限制：RoHS Annex II、REACH SVHC、Prop 65、J-MOSS、K-RoHS、PFAS 报告",
-            "关键矿产：锂钴镍石墨供应链尽职调查（EU CSDDD、Battery Reg Article 49 等）",
-            "工厂生产控制（FPC）/ 制造工艺合规",
-            "数字产品护照（DPP）/ 电池护照原料披露",
-            "供应链碳足迹（EU Battery Reg Article 7、ISO 14067）",
+        "static_topics": [
+            {
+                "id": "prod-substance-restrictions",
+                "name": "物质限制 / 申报披露",
+                "scope_hint": "产品中限用物质、申报披露义务。"
+                              "典型框架:RoHS Annex II、REACH SVHC、PFAS 限制(EU/各州)、Prop 65、J-MOSS、K-RoHS",
+            },
+            {
+                "id": "prod-supply-chain-due-diligence",
+                "name": "关键矿产 / 供应链尽调",
+                "scope_hint": "关键矿产(锂/钴/镍/石墨)供应链尽职调查、强迫劳动审查。"
+                              "典型框架:EU CSDDD、Battery Reg Article 49、UFLPA、矿产追溯",
+            },
+            {
+                "id": "prod-digital-product-passport",
+                "name": "数字产品护照 / 碳足迹",
+                "scope_hint": "数字产品护照、电池护照、碳足迹申报。"
+                              "典型框架:EU Battery Reg Article 7/77、ESPR DPP、ISO 14067、Battery Passport 实施细则",
+            },
         ],
     },
     "CERT": {
         "name": "CERT 准入认证",
-        "subtopics": [
-            "型式认证 / 产品注册 / 合格评定（DoC）的程序变更",
-            "强制认证：CCC / KC / PSE / UL / CE / UKCA",
-            "经济运营商注册 / 生产者-进口商-经销商义务主体认定",
-            "数字提交 / 简化路径 / 跨境互认协议",
+        "static_topics": [
+            {
+                "id": "cert-mandatory-marks",
+                "name": "强制认证标志",
+                "scope_hint": "各国强制产品认证、合格评定程序变更、互认协议。"
+                              "典型框架:CCC、KC、CE、UKCA、UL、PSE、INMETRO、BSMI",
+            },
+            {
+                "id": "cert-economic-operator",
+                "name": "经济运营商义务",
+                "scope_hint": "生产者/进口商/经销商主体认定、注册、文档保留义务。"
+                              "典型框架:EU MSR、Battery Reg、ESPR、Importer Authorized Representative",
+            },
         ],
     },
     # ── 售中 ───────────────────────────────────────────────────────────
     "IMPORT": {
         "name": "IMPORT 进口 / 流通",
-        "subtopics": [
-            "海关分类 / 进口许可 / HS Code 调整",
-            "跨境电商监管（平台备案、清关流程）",
-            "关税 / 反倾销税 / 出口管制 / 制裁名单",
-            "危险品运输：IATA DGR、IMDG Code、ADR / RID、US DOT / PHMSA",
+        "static_topics": [
+            {
+                "id": "import-dangerous-goods",
+                "name": "危险品运输(锂电池)",
+                "scope_hint": "锂电池跨境运输的危险品分类、包装、申报、运输测试要求。"
+                              "典型框架:IATA DGR、IMDG Code、ADR/RID、US DOT/PHMSA、UN 38.3",
+            },
+            {
+                "id": "import-customs-trade-control",
+                "name": "海关 / 贸易管制",
+                "scope_hint": "HS Code 调整、关税/反倾销、出口管制、跨境电商监管、制裁名单。"
+                              "典型场景:中欧美贸易摩擦、跨境电商平台备案、清关流程",
+            },
         ],
     },
     "RETAIL": {
         "name": "RETAIL 零售 / 销售合规",
-        "subtopics": [
-            "销售前年龄验证 / 资格验证 / 强制安全警示展示",
-            "强制信息披露 / 标签（在售期间）",
-            "广告限制 / 误导性宣传禁止 / 网红营销规范",
-            "平台连带责任（电商平台 / 跨境零售）",
-            "补贴 / 财政激励 / 以旧换新 / 能效标签（影响销售决策）",
+        "static_topics": [
+            {
+                "id": "retail-incentives-energy-label",
+                "name": "补贴 / 能效标签",
+                "scope_hint": "各国新能源补贴政策、能效标签强制要求、以旧换新计划。"
+                              "影响销售决策。典型场景:中欧美/东南亚电动出行补贴、CHPS、能效等级",
+            },
+            {
+                "id": "retail-marketing-platform",
+                "name": "广告 / 平台连带责任",
+                "scope_hint": "误导性宣传禁止、网红营销规范、电商平台备案、销售前年龄验证、"
+                              "强制安全警示展示、跨境零售平台连带责任",
+            },
         ],
     },
     "USE": {
         "name": "USE 消费者使用",
-        "subtopics": [
-            "消费者强制第三方责任险（RCA / MTPL）",
-            "车辆登记 / 牌照 / 唯一识别 / VIN / 防伪标识",
-            "驾照等级 / 年龄 / 头盔 / 反光装备 / PPE",
-            "路权（人行道 / 自行车道）/ 限速 / 载客载重 / 改装禁令",
-            "共享出行运营许可 / 电子围栏 / 强制停放区",
-            "室内充电 / 公寓 / 停车场充电消防规则",
-            "试点项目 / 上路许可 / 区域限制（trial schemes / pilot programs）",
+        "static_topics": [
+            {
+                "id": "use-traffic-rules-ppe",
+                "name": "路权 / 限速 / PPE",
+                "scope_hint": "各国/各市电动出行产品上路规则、限速、头盔强制、改装禁令、"
+                              "车道权(人行道/自行车道)、载客载重限制、试点项目区域准入",
+            },
+            {
+                "id": "use-shared-mobility",
+                "name": "共享出行运营",
+                "scope_hint": "共享电动滑板车/自行车的运营许可、电子围栏、强制停放区、"
+                              "车队规模限制、运营商责任、用户行为约束",
+            },
+            {
+                "id": "use-registration-insurance",
+                "name": "登记 / 保险 / 驾照",
+                "scope_hint": "车辆登记/牌照、唯一识别(VIN/防伪标识)、强制第三方责任险(RCA/MTPL)、"
+                              "驾照等级要求、年龄限制",
+            },
+            {
+                "id": "use-charging-fire-safety",
+                "name": "充电消防",
+                "scope_hint": "室内/公寓/停车场充电消防规则、锂电池火灾预防、电池存放安全。"
+                              "近年新加坡、欧洲、北美密集出台专项规定(电池起火事件催生)",
+            },
         ],
     },
     # ── 售后 ───────────────────────────────────────────────────────────
     "ENFORCE": {
         "name": "ENFORCE 执法 / 监管行动",
-        "subtopics": [
-            "召回令 / 缺陷公告 / 强制召回（EU Safety Gate、CPSC、SAMR、ACCC）",
-            "罚款决议 / 行政处罚",
-            "市场监管行动 / 执法通告 / 违规清单",
-            "违规改装查扣 / 强制下架",
+        "static_topics": [
+            {
+                "id": "enforce-recalls-actions",
+                "name": "召回 / 罚款 / 下架",
+                "scope_hint": "各国市场监管局执法动作:召回令、缺陷公告、强制召回、罚款决议、"
+                              "行政处罚、违规改装查扣、强制下架。典型来源:EU Safety Gate、CPSC、"
+                              "SAMR、ACCC、ANSES、KCA",
+            },
         ],
     },
     "EOL": {
         "name": "EOL 回收 / 处置",
-        "subtopics": [
-            "EPR / WEEE / 电池回收义务、回收率目标",
-            "押金返还制度 / 生产者责任登记",
-            "报废处理流程 / 跨境废弃物转移（巴塞尔公约）",
-            "责任险（产品责任 / 回收责任 / 反垄断 / 平台连带）",
+        "static_topics": [
+            {
+                "id": "eol-epr-battery-recycling",
+                "name": "EPR / 电池回收",
+                "scope_hint": "生产者责任延伸(EPR)注册、WEEE 回收义务、电池回收率目标、"
+                              "押金返还制度、跨境废弃物转移(巴塞尔公约)、报废处理流程",
+            },
         ],
     },
 }
@@ -175,7 +252,11 @@ CALL_TIMEOUT = 240
 
 # 每议题双温度：低温捞确凿头部、高温捞长尾。
 _FETCH_TEMPS = (0.2, 1.0)
-_PLAN_TEMP   = 0.3   # 议题图要稳定但不过度收敛
+_PLAN_TEMP   = 0.3   # AI 发散位:稳定但不过度收敛
+
+# AI 发散位上限。允许 LLM 返回 0(没有真新增议题就不补,反对凑数)。
+# 议题总数 = 静态 18 + 动态 ≤ 5 = 上限 23。
+MAX_DYNAMIC_DISCOVERY = 5
 
 # 并发数（保守值；Gemini Flash 限流时会自然降速）
 _PLAN_WORKERS  = 4
@@ -194,22 +275,34 @@ def _category_block() -> str:
     return "\n".join(lines)
 
 
-def _subtopics_block(subtopics: list[str]) -> str:
-    return "\n".join(f"  {i+1}. {s}" for i, s in enumerate(subtopics))
+# ── Plan 阶段：议题图(静态全集 + AI 发散补充)────────────────────────────────
+#
+# 设计:
+#   静态优先 — 18 个人工维护的核心议题(DIMENSIONS.static_topics)直接返回,
+#              零 LLM 调用、可重现、可被业务侧 review/编辑。
+#   AI 发散 — 在静态议题之外,LLM 最多补 5 个不重叠新兴议题(允许 0 个)。
+#   降级路径 — AI 发散失败不阻断 pipeline,纯静态 18 条已足够保底。
+#
+# 颗粒度原则见 DIMENSIONS 注释:新法规高频更新单列、老法规打包、跨多法域成熟体系打包。
+
+def _format_static_block(topics: list[dict]) -> str:
+    """格式化静态议题列表为 prompt 可读的块。"""
+    return "\n".join(
+        f"  {i+1}. [{t['id']}] {t['name']} — {t['scope_hint']}"
+        for i, t in enumerate(topics)
+    )
 
 
-# ── Plan 阶段：议题图枚举 ─────────────────────────────────────────────────────
+def _discover_extra_topics(dim_id: str, static: list[dict]) -> list[dict]:
+    """让 LLM 在静态议题之外补最多 MAX_DYNAMIC_DISCOVERY 个新兴议题。
 
-def _enumerate_topics(dim_id: str, quick: bool) -> list[dict]:
+    LLM 看到完整静态议题列表 + 业务范围,在 prompt 强约束下:
+      - 不能与静态议题主题重叠(包括 scope_hint 涵盖的细分)
+      - 必须基于"近 12 个月新出现的监管动向"
+      - 没有真新增就返回 [],反对凑数
+
+    失败时返回空列表(纯静态保底)。
     """
-    让模型枚举该维度下值得监控的议题清单。
-    议题 = 监管面，跨年度稳定；具体法规由 fetch 阶段在议题下抓取。
-
-    dim_id：八维 L3 代码之一（"RD" / "PROD" / "CERT" / "IMPORT" / "RETAIL" / "USE" / "ENFORCE" / "EOL"）。
-    quick 参数当前不影响议题图，保留是为了将来需要时能差异化。
-    返回 [{id, name, scope_hint}]，失败时 fallback 到 DIMENSIONS.subtopics。
-    """
-    _ = quick  # reserved
     today = datetime.now().strftime("%Y-%m-%d")
     dim   = DIMENSIONS[dim_id]
 
@@ -217,14 +310,15 @@ def _enumerate_topics(dim_id: str, quick: bool) -> list[dict]:
         today=today,
         dim_lower=dim_id.lower(),
         dim_name=dim["name"],
-        subtopics_block=_subtopics_block(dim["subtopics"]),
+        static_count=len(static),
+        static_topics_block=_format_static_block(static),
+        max_extra=MAX_DYNAMIC_DISCOVERY,
         category_block=_category_block(),
     )
 
     try:
-        # 议题图不需要联网搜索——它是基于模型先验知识的"应监控面清单"。
-        # 用 lite + 关 thinking：本任务是"按业务范围模板填 JSON 议题列表"，
-        # 不需要复杂推理。flash + thinking 此处属于浪费。
+        # 议题图不需要联网搜索——基于模型先验知识。
+        # lite + 关 thinking + 低温:JSON 模板填字段,无需推理链。
         text = ai_client.call_json(
             prompt,
             system=prompts.load("researcher_plan_system").format(
@@ -234,14 +328,16 @@ def _enumerate_topics(dim_id: str, quick: bool) -> list[dict]:
             model="gemini-2.5-flash-lite",
             thinking_budget=0,
         )
-        topics = parse_json_array(text) or []
+        candidates = parse_json_array(text) or []
     except Exception as e:
-        _log.warning("PLAN %s failed: %s — fallback to subtopics", dim_id, e)
-        topics = []
+        _log.warning("DISCOVER %s failed: %s — 纯静态(%d 个议题)足够保底",
+                     dim_id, e, len(static))
+        return []
 
-    valid: list[dict] = []
-    seen_ids: set[str] = set()
-    for t in topics:
+    static_ids = {t["id"] for t in static}
+    extras: list[dict] = []
+    seen_ids: set[str] = set(static_ids)
+    for t in candidates[:MAX_DYNAMIC_DISCOVERY]:
         if not isinstance(t, dict):
             continue
         tid  = (t.get("id")   or "").strip()
@@ -249,25 +345,34 @@ def _enumerate_topics(dim_id: str, quick: bool) -> list[dict]:
         if not tid or not name or tid in seen_ids:
             continue
         seen_ids.add(tid)
-        valid.append({
+        extras.append({
             "id":         tid,
             "name":       name,
             "scope_hint": (t.get("scope_hint") or "").strip(),
         })
 
-    if not valid:
-        # Plan 失败兜底：把现有 subtopics 当议题用，至少不退化为零召回。
-        valid = [
-            {
-                "id":         f"{dim_id.lower()}-fallback-{i+1}",
-                "name":       s.split("：")[0][:20] if "：" in s else s[:20],
-                "scope_hint": s,
-            }
-            for i, s in enumerate(dim["subtopics"])
-        ]
-        _log.info("PLAN %s using subtopics fallback (%d topics)", dim_id, len(valid))
+    if extras:
+        _log.info("DISCOVER %s found %d extra topics: %s",
+                  dim_id, len(extras), [t["id"] for t in extras])
+    else:
+        _log.info("DISCOVER %s 无新增议题(LLM 返回空或全部重叠)", dim_id)
+    return extras
 
-    return valid
+
+def _enumerate_topics(dim_id: str, quick: bool = False, no_dynamic_discovery: bool = False) -> list[dict]:
+    """返回该维度的议题列表 = 静态全集 + (可选)AI 发散补充。
+
+    dim_id:八维 L3 代码之一。
+    quick:保留兼容,当前不影响议题图。
+    no_dynamic_discovery=True:跳过 LLM 调用,纯静态 18 条。
+                           调试 / 离线对照实验用。
+    """
+    _ = quick  # reserved
+    static = list(DIMENSIONS[dim_id]["static_topics"])
+    if no_dynamic_discovery:
+        return static
+    extras = _discover_extra_topics(dim_id, static)
+    return static + extras
 
 
 # ── Fetch 阶段：单议题召回 ─────────────────────────────────────────────────────
@@ -479,9 +584,14 @@ def _store(reg: dict, sources: list[dict]) -> bool:
 
 # ── 主入口：三阶段编排 ────────────────────────────────────────────────────────
 
-def run_research(quick: bool = False) -> tuple[int, int]:
+def run_research(quick: bool = False, no_dynamic_discovery: bool = False) -> tuple[int, int]:
     """
     三阶段：Plan（议题图）→ Fetch（双温度召回）→ Audit（零命中补查）。
+
+    quick:仅近 90 天新发布(默认含 365 天即将生效)。
+    no_dynamic_discovery=True:议题图纯静态(18 条),跳过 AI 发散位调用。
+                              调试 / A-B 对照实验用,默认 False。
+
     返回 (inserted, skipped) 与旧版签名兼容。
     """
     init_db()
@@ -502,7 +612,7 @@ def run_research(quick: bool = False) -> tuple[int, int]:
         max_workers=_PLAN_WORKERS, thread_name_prefix="plan",
     ) as ex:
         plan_futs = {
-            ex.submit(_enumerate_topics, dim_id, quick): dim_id
+            ex.submit(_enumerate_topics, dim_id, quick, no_dynamic_discovery): dim_id
             for dim_id in DIMENSIONS
         }
         for fut in concurrent.futures.as_completed(plan_futs):
@@ -617,4 +727,7 @@ def run_research(quick: bool = False) -> tuple[int, int]:
 
 if __name__ == "__main__":
     import sys
-    run_research(quick="--quick" in sys.argv)
+    run_research(
+        quick="--quick" in sys.argv,
+        no_dynamic_discovery="--no-dynamic-discovery" in sys.argv,
+    )

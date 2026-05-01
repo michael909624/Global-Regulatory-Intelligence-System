@@ -19,9 +19,13 @@ HELP = """
 
   run               完整流水线：发现 → 聚类 → 抓取 → 分析 → 报告（5步）
   run --quick       快速模式：仅搜索近 90 天新发布
+  run --no-dynamic-discovery
+                    议题图纯静态(18 条),跳过 AI 发散位调用 — 调试/A-B 对照用
 
   research          Gemini 发现层：议题图召回（plan/fetch/audit 三阶段）
   research --quick  快速模式（仅新发布窗口）
+  research --no-dynamic-discovery
+                    同上 — 议题图纯静态,可重现可对照
 
   consolidate       Stage 0 法规编号聚类：同 reg_id 软合并到主条目
   scrape            抓取待处理 URL 的网页/PDF 原文
@@ -82,8 +86,9 @@ def cmd_research(args: list[str]):
     import researcher
     import ai_client
     quick = "--quick" in args
+    no_dynamic = "--no-dynamic-discovery" in args
     ai_client.reset_token_stats()
-    researcher.run_research(quick=quick)
+    researcher.run_research(quick=quick, no_dynamic_discovery=no_dynamic)
     ai_client.print_token_summary()
 
 
@@ -163,6 +168,7 @@ def cmd_run(args: list[str]):
     import reporter
 
     quick = "--quick" in args
+    no_dynamic = "--no-dynamic-discovery" in args
     ai_client.reset_token_stats()
 
     def _elapsed(t0: float) -> str:
@@ -179,7 +185,7 @@ def cmd_run(args: list[str]):
     print(f"\n[1/7] Gemini 发现层（{mode_label}）...")
     t0 = time.time()
     try:
-        inserted, skipped = researcher.run_research(quick=quick)
+        inserted, skipped = researcher.run_research(quick=quick, no_dynamic_discovery=no_dynamic)
         print(f"      完成 ({_elapsed(t0)})  入库 {inserted} 条待抓取，重复 {skipped} 条")
         results["发现"] = (True, f"入库 {inserted} 条")
     except Exception as e:
