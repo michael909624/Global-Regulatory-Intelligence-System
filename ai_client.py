@@ -308,8 +308,16 @@ def _do_call_with_retry(
     retries: int,
     grounded: bool = False,
 ):
-    """共享重试逻辑;返回 SDK 原始 response。同时记录 token usage。"""
+    """共享重试逻辑;返回 SDK 原始 response。同时记录 token usage。
+
+    退避策略:
+      • 限流(429/quota/rate-limit) → 指数加倍 60s → 120s → 240s,日限场景下
+        早 fail-fast 比无限等待更利于运维察觉(总尝试 retries+1 次后抛错)
+      • 常规错误                    → 线性 8s × attempt
+    日志含 retry 进度 + 累计等待秒数,长跑时可一眼判断卡在重试还是死锁。
+    """
     last_err: Exception | None = None
+    total_waited = 0
     for attempt in range(retries + 1):
         try:
             resp = get_client().models.generate_content(
@@ -320,14 +328,19 @@ def _do_call_with_retry(
         except Exception as e:
             last_err = e
             if attempt < retries:
-                # 限流时等更久,常规错误指数退避
-                wait = 60 if _is_rate_limit(e) else 8 * (attempt + 1)
+                rate_limited = _is_rate_limit(e)
+                wait = 60 * (2 ** attempt) if rate_limited else 8 * (attempt + 1)
+                total_waited += wait
+                tag = "RATE-LIMIT" if rate_limited else "RETRY"
                 _log.warning(
-                    "%s attempt %d/%d failed: %s — wait %ds",
-                    label, attempt + 1, retries + 1, e, wait,
+                    "%s [%s] attempt %d/%d failed: %s — wait %ds (total_waited=%ds)",
+                    label, tag, attempt + 1, retries + 1, e, wait, total_waited,
                 )
                 time.sleep(wait)
-    raise RuntimeError(f"{label} failed after {retries + 1} attempts: {last_err}")
+    raise RuntimeError(
+        f"{label} failed after {retries + 1} attempts "
+        f"(total_waited={total_waited}s): {last_err}"
+    )
 
 
 class BlockedResponseError(RuntimeError):
