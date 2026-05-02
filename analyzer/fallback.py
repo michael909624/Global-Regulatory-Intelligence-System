@@ -112,13 +112,13 @@ def _gemini_grounding_fetch(title: str, url: str, market: str, relevance: str) -
 
 
 def enforce_fallback_caps(result: dict) -> None:
-    """合成路径不变量：importance 不超过 🟡，importance_note 必含「数据来源：AI 合成」。"""
+    """合成路径不变量：importance 字段不再由 LLM 输出（重要度由下游 llm_priority 判定）;
+    此函数保留作为防御——LLM 偶尔可能基于训练知识自作主张输出 importance=🔴,
+    强制降为 🟡 防止合成版误进高优先级。
+    SYNTHESIS_WARNING 由 main.py 通过 extra_biz 注入到 business_impact,无需此处再加标。
+    """
     if result.get("importance") == "🔴":
         result["importance"] = "🟡"
-    note = (result.get("importance_note") or "").strip()
-    if "数据来源：AI 合成" not in note:
-        note = (note + " ｜ 数据来源：AI 合成").strip(" ｜")
-    result["importance_note"] = note
 
 
 def requeue_navigation_failures() -> int:

@@ -22,8 +22,6 @@
     "consultation_close": "YYYY-MM-DD 或 null"
   }},
   "deadline":            "YYYY-MM-DD 或 null",
-  "importance":          "🟡（合成版上限,不可填 🔴；🟢 已废弃）",
-  "importance_note":     "「阶段N + CX → 档位」",
   "worst_case":          "字符串；合成资料未提及时填「待确认」",
   "business_impact":     "对我司影响要点（仅基于合成资料明确提及的信息）",
   "business_dimensions": "数组；相关时填 1-3 个 L3 代码（RD/PROD/CERT/IMPORT/RETAIL/USE/ENFORCE/EOL），全部不沾时填 []",

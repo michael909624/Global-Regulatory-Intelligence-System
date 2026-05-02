@@ -4,9 +4,8 @@
 
 下文是 Gemini 通过 Google Search 合成的资料（非官方原文，含幻觉风险）。
 请按以下额外约束：
-  • importance 一律不超过 🟡（即使评分逻辑指向 🔴 — 合成数据置信度天然低于原文，
-    上述参考案例中的 🔴 档位在本模式下统一降为 🟡）
   • 不要凭空写出具体日期或罚款金额；不确定时留 null 或在 worst_case 写「待确认」
   • 其他字段（requirement / business_impact / affected_products / affected_markets）
     仍按主分析规则填写，但只引用合成资料明确提及的信息
-注：「数据来源：AI 合成」标记由系统在事后自动追加，无需你写。
+注：「数据来源：AI 合成」标记由系统在事后自动追加，无需你写；
+    重要度由下游 llm_priority 集中判定，且合成版会自动降级，无需你输出 importance 字段。
