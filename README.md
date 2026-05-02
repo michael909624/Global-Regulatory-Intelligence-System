@@ -212,11 +212,15 @@ GEMINI_API_KEY = "AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 > Mac 用户把下面所有 `python` 替换成 `python3`。
 
 ```bash
-python gris.py run --quick    # 快速扫描(5-10 分钟)
-python gris.py run            # 完整扫描(20-30 分钟)
+python gris.py run --quick    # 快速扫描(近 90 天新法规,5-15 分钟)
+python gris.py run            # 完整扫描(全部法规,20-40 分钟)
 python gris.py status         # 看数据库统计
-python gris.py view 高        # 终端查看高影响法规
-python gris.py report         # 重新生成 Excel(不重抓)
+python gris.py view 高        # 终端查看 🔴 重要法规(支持 高/中)
+python gris.py view_dropped   # 看 triage 预筛 drop 清单防误杀(可 --pursue <id> 恢复某条)
+python gris.py consolidate    # 法规编号聚类:同 reg_id 软合并到主条目
+python gris.py backfill       # 补全缺失的来源 URL(Gemini 逐条查找)
+python gris.py reanalyze      # 重置「不相关」条目并重新分析
+python gris.py report         # 重新生成 Excel(不重抓数据)
 python gris.py                # 显示完整命令帮助
 ```
 
@@ -295,38 +299,61 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 ## 文件结构(技术好奇者可看)
 
+系统的核心思路是 **"4 步流水线 + 多个 AI 决策点"**:每一步都有规则 + AI 的双层防御,
+信息从粗到细逐层过滤,既控成本又防漏球。
+
 ```
 gris/
 ├── gris.py              # 主入口(命令分发)
 ├── researcher.py        # 第 1 步:Gemini 搜索发现 + URL 质量门
+├── consolidator.py      #   Stage 0:法规编号软聚类(reg_id 规则 + LLM 语义残余兜底)
 ├── scraper.py           # 第 2 步:抓网页/PDF + 占位页/空壳页拒收
-├── analyzer/            # 第 3 步:AI 合规分析(已拆包)
-│   ├── main.py          #   主分析流程 + 30 天去重(原文优先)
-│   ├── fallback.py      #   抓取失败时的 grounded 合成兜底
-│   ├── consolidation.py #   多条同法规合并(2-Pass + 矛盾拒收)
-│   ├── values.py        #   字段标准化
+├── analyzer/            # 第 3 步:AI 合规分析(已拆包,多个 AI 决策点)
+│   ├── llm_triage.py    #   scrape 前预筛:批量 drop 明显无关条目,省下游成本
+│   ├── main.py          #   主分析:原文 → compliance_analysis(原文优先 + 30 天去重)
+│   ├── fallback.py      #   抓取失败时的 Gemini grounded 合成兜底
+│   ├── consolidation.py #   Stage 3 二次合并(reg_id 规则 + 维度软聚类 + 矛盾拒收)
+│   ├── llm_dedup.py     #   终末轻量 LLM 语义去重(规则去不掉的残余)
+│   ├── llm_priority.py  #   末端 AI 终审:批量判 L1/L2 重要度 + P0/P1 优先级
+│   ├── priority.py      #   时间窗口判定 + LLM 失败的启发式兜底
+│   ├── values.py        #   LLM 输出字段标准化 + 入库
 │   ├── backfill.py      #   历史数据回填
-│   └── _shared.py       #   公共工具
-├── consolidator.py      # 全局二次去重(含 LLM 语义聚类残余兜底)
+│   └── _shared.py       #   公共常量、prompts、文本截断、并发锁
 ├── reporter.py          # 第 4 步:生成 Excel + ⚠️ 合成警告兜底显示
-├── classify.py          # 影响等级分类
+├── classify.py          # 影响等级分类(产品/市场标准化)
 ├── authority.py         # 监管机构权威度评分
 ├── evaluate.py          # 评估/调试工具
-├── ai_client.py         # Gemini 客户端封装
+├── ai_client.py         # Gemini 客户端封装(重试/退避/token 统计/成本估算)
 ├── seeds.py             # 启动时的种子法规库
-├── database.py          # SQLite 数据库 schema + 查询
+├── database.py          # SQLite 数据库 schema + 查询 + 迁移
 ├── manual_input.py      # 抓取失败时人工补录
-├── utils.py             # 通用工具
+├── utils.py             # 通用工具(reg_id 归一化、JSON 容错解析等)
 ├── config.py            # 公共配置
 ├── config_local.py      # 你的 API key(自建,不要分享)
 ├── requirements.txt     # Python 依赖
-├── prompts/             # 所有 LLM prompts(独立文件,便于改写)
-├── tests/               # 单元测试
+├── prompts/             # 所有 LLM prompts(21 个独立文件,便于改写)
+├── rules/               # 业务规则数据(法规别名、市场分级、导航词表等)
+├── tests/               # 召回率评测套件(含 5k/20k 合成池 + adversarial 注入测试)
 ├── .github/workflows/   # GitHub Actions 配置(run.yml)
 ├── data/                # 数据库
 ├── logs/                # 日志
 └── reports/             # Excel 输出
 ```
+
+**Pipeline 全貌(10 个阶段,主要决策点都有 AI 参与)**:
+
+| 阶段 | 模块 | 输入 | AI 决策 |
+|------|------|------|---------|
+| 1. 发现 | `researcher.py` | 议题列表 | Plan(发散议题)+ Fetch(grounded 搜索) |
+| 1.5. 编号聚类 | `consolidator.py` | raw_search_results | reg_id 规则 + LLM 残余语义聚类 |
+| 2. 抓取 | `scraper.py` | source_url | 无 AI(纯 HTTP/PDF) |
+| 2.5. 预筛 | `analyzer/llm_triage.py` | raw 候选 | LLM 批判:pursue/drop |
+| 3a. 主分析 | `analyzer/main.py` | scraped 原文 | LLM 抽客观字段(JSON) |
+| 3b. 合成兜底 | `analyzer/fallback.py` | 抓取失败条目 | LLM grounded 合成 + 抽字段 |
+| 3c. 整合 | `analyzer/consolidation.py` | compliance_analysis | reg_id 合并 + LLM 语义合并 |
+| 3d. 终末去重 | `analyzer/llm_dedup.py` | 残余条目 | 轻量 LLM 语义近似 |
+| 3e. 终审 | `analyzer/llm_priority.py` | 全部条目 | 批量判 L1/L2 + P0/P1 |
+| 4. 报告 | `reporter.py` | 排序后条目 | 无 AI(纯 Excel 渲染) |
 
 ---
 
