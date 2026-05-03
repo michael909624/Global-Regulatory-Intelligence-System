@@ -381,6 +381,7 @@ def call_grounded(
     retries: int = DEFAULT_RETRIES,
     return_sources: bool = True,
     thinking_budget: int | None = None,
+    max_output_tokens: int | None = None,
 ) -> tuple[str, list[dict]]:
     """
     带 Google Search grounding 的调用。
@@ -391,6 +392,11 @@ def call_grounded(
       0    → 关闭 thinking（适合简单事实查询，节省 ~62% 输出成本）
       N>0  → 限制最多 N 个 thinking tokens
       不支持 thinking 的模型（如 Pro 强制 thinking）会被 SDK 忽略此参数。
+
+    max_output_tokens:
+      None → 模型默认上限(对 Gemini 2.5/3 系列可达 8K-64K,偶发会让 LLM
+             写"百科全书式"长篇综述,单次调用耗时 1-2 分钟)
+      N    → 强制截断到 N tokens,grounded fetch 类任务建议 4096-8192
 
     return_sources=False 时跳过 sources 解析(节省一点点),仍返回元组以兼容签名。
     """
@@ -403,6 +409,8 @@ def call_grounded(
         cfg_kwargs["top_p"] = top_p
     if thinking_budget is not None:
         cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+    if max_output_tokens is not None:
+        cfg_kwargs["max_output_tokens"] = max_output_tokens
     cfg = types.GenerateContentConfig(**cfg_kwargs)
 
     resp = _do_call_with_retry(
@@ -441,6 +449,7 @@ def call_json(
     model: str = DEFAULT_MODEL,
     retries: int = DEFAULT_RETRIES,
     thinking_budget: int | None = None,
+    max_output_tokens: int | None = None,
 ) -> str:
     """
     无 grounding,要求 JSON 响应。
@@ -450,6 +459,10 @@ def call_json(
       None → 默认（Flash thinking model 全开，输出价含 thinking tokens）
       0    → 关 thinking（结构化模板填充类任务可关，节省 ~62% 输出成本）
       N>0  → 限制 thinking 上限
+
+    max_output_tokens:
+      None → 模型默认上限
+      N    → 强制截断 — JSON schema 抽字段类任务推荐 2048-4096
     """
     cfg_kwargs = {
         "system_instruction": system,
@@ -458,6 +471,8 @@ def call_json(
     }
     if thinking_budget is not None:
         cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+    if max_output_tokens is not None:
+        cfg_kwargs["max_output_tokens"] = max_output_tokens
     cfg = types.GenerateContentConfig(**cfg_kwargs)
     resp = _do_call_with_retry(
         label="call_json", model=model, prompt=prompt, cfg=cfg, retries=retries,

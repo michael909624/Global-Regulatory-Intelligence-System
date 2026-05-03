@@ -99,6 +99,10 @@ def _gemini_grounding_fetch(title: str, url: str, market: str, relevance: str) -
         # 内容补全也用 temp=0,只想要事实性引用,不要发挥
         # 跟 researcher fetch 一致用 Gemini 3.1 Pro — grounded search 复杂查询规划
         # 显著强于 flash;Gemini 3 grounded 超额单价还更便宜($14/k vs $35/k)
+        # max_output_tokens=8192:防 LLM 进入"百科全书式综述"模式输出 13 万 tokens
+        # 卡 1-2 分钟(实测案例:2026-05-02 23:53:16 单条 130k tokens)
+        # thinking_budget=0:grounded fetch 是"搜索 + 整理引用"的字面任务,
+        # 不需要思考链(Pro 强制 thinking 时此参数会被 SDK 忽略,无害)
         text, _ = ai_client.call_grounded(
             prompt,
             system=prompts.load("grounding_fetch_system"),
@@ -106,6 +110,8 @@ def _gemini_grounding_fetch(title: str, url: str, market: str, relevance: str) -
             temperature=0.0,
             top_p=None,
             return_sources=False,
+            max_output_tokens=8192,
+            thinking_budget=0,
         )
         text = text.strip()
         return text or None

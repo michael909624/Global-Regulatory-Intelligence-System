@@ -433,6 +433,8 @@ def _fetch_topic(
     # Gemini 3.1 Pro grounded — 复杂多议题查询规划显著强于 flash,直接关系召回率。
     # 不传 thinking_budget(走默认全开):grounded search 受益于 thinking 来规划查询。
     # 附加红利:Gemini 3 grounded 超额单价 $14/k(2.5 系列 $35/k),反而部分省钱。
+    # max_output_tokens=8192:防 LLM 输出爆炸卡顿(fallback 实测同模型曾输出
+    # 130k tokens 单条卡 2 分钟)。议题召回每条 ~5-15 个法规,8K 输出富裕。
     text, sources = ai_client.call_grounded(
         prompt,
         system=prompts.load("researcher_system").format(
@@ -440,6 +442,7 @@ def _fetch_topic(
         ),
         model="gemini-3.1-pro-preview",
         temperature=temperature,
+        max_output_tokens=8192,
     )
     regs = parse_json_array(text) or []
     return regs, sources
