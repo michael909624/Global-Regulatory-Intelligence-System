@@ -6,8 +6,9 @@ priority.py 退化为兜底（仅 LLM 失败时启用）。
 
 设计原则：
   • 横向看所有候选 — 比单条独立分析更准（"加州这 5 条 SB 都该 P0 吗？"）
-  • 用最便宜的 gemini-2.5-flash-lite + thinking_budget=0
-  • 单次批量调用 ~$0.005
+  • 用 Gemini 3 Flash + thinking_budget=1024 — P0/P1 是综合判断,
+    lite 关 thinking 在这种综合任务上欠配置;flash + 适度 thinking 准确度显著提升,
+    批量调用绝对成本仅 ~$0.05-0.15/run。
   • 失败时降级（什么都不写 → reporter 走 priority.score_fallback）
   • few-shot 例子在 prompts/llm_priority_system.txt（用户可读可改）
 
@@ -27,7 +28,7 @@ from utils import get_logger, parse_json_array
 
 _log = get_logger("llm_priority")
 
-_MODEL = "gemini-2.5-flash-lite"
+_MODEL = "gemini-3-flash-preview"
 _PRIORITY_SYSTEM = prompts.load("llm_priority_system")
 
 # 单批最大候选数。lite 上下文宽，每条 ~150 字 × 60 条 ~ 9k tokens 可控。
@@ -107,7 +108,7 @@ def _judge_batch(rows: list, today: str) -> dict[int, tuple[str, str, str]]:
     try:
         resp = ai_client.call_json(
             prompt, system=_PRIORITY_SYSTEM,
-            model=_MODEL, thinking_budget=0,
+            model=_MODEL, thinking_budget=1024,
         )
     except Exception as e:
         _log.warning("priority batch (%d 条) 调用失败: %s — 留空交 priority 兜底",
