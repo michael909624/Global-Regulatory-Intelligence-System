@@ -97,9 +97,12 @@ def _gemini_grounding_fetch(title: str, url: str, market: str, relevance: str) -
     )
     try:
         # 内容补全也用 temp=0,只想要事实性引用,不要发挥
+        # 跟 researcher fetch 一致用 Gemini 3.1 Pro — grounded search 复杂查询规划
+        # 显著强于 flash;Gemini 3 grounded 超额单价还更便宜($14/k vs $35/k)
         text, _ = ai_client.call_grounded(
             prompt,
             system=prompts.load("grounding_fetch_system"),
+            model="gemini-3.1-pro-preview",
             temperature=0.0,
             top_p=None,
             return_sources=False,
@@ -190,8 +193,13 @@ def _fallback_one(idx: int, total: int, row) -> str:
     )
 
     try:
-        # 与主分析一致,关 thinking — 合成路径同样是 JSON 模板填充任务
-        text   = ai_client.call_json(prompt, system=FALLBACK_SYSTEM, thinking_budget=0)
+        # 与主分析路径一致 — Gemini 3.1 Pro + 适度 thinking,提升合成版字段抽取质量。
+        # fallback 占调用量 ~5%,绝对成本影响小,但合成版可信度本来就低,质量优先。
+        text = ai_client.call_json(
+            prompt, system=FALLBACK_SYSTEM,
+            model="gemini-3.1-pro-preview",
+            thinking_budget=2048,
+        )
         result = parse_json_object(text)
         if not result:
             _mark_manual(row["id"])
