@@ -566,7 +566,7 @@ def get_week_analyses(since: str) -> list[sqlite3.Row]:
 def get_manual_followup() -> list[sqlite3.Row]:
     with get_connection() as conn:
         return conn.execute("""
-            SELECT title, source_url, query_date
+            SELECT id, title, title_cn, source_url, query_date
             FROM raw_search_results
             WHERE scrape_status = '需人工'
             ORDER BY query_date DESC

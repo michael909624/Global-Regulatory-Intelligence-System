@@ -14,10 +14,81 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+import ai_client
 import authority
 import rules
 from config import REPORTS_DIR
-from database import init_db, get_all_analyses, get_week_analyses, get_manual_followup
+from database import (
+    init_db, get_all_analyses, get_week_analyses, get_manual_followup,
+    get_connection,
+)
+from utils import get_logger, parse_json_array
+
+_log = get_logger("reporter")
+
+# 需人工跟进 sheet 的标题翻译 — 只翻译 title_cn 为空的条目,翻译结果写回 DB
+# 后续 run 不重复调 AI(成本累加保护)。简单标题翻译用 lite 完全胜任。
+_TRANSLATE_MODEL = "gemini-3.1-flash-lite-preview"
+_TRANSLATE_BATCH_SIZE = 30
+_TRANSLATE_SYSTEM = (
+    "你是法规情报系统的翻译助手。把每个法规/通知标题翻译成简洁准确的中文,"
+    "保留原文里的法规编号(如 EU 2023/1542 / GB 17761 / SB 1271),不译机构名首字母缩写。"
+    "仅输出 JSON 数组,顺序对应输入,每个元素是中文翻译字符串,不含其他文本。"
+)
+
+
+def _translate_titles_batch(titles: list[str]) -> list[str]:
+    """批量翻译标题。失败或缺漏返回空字符串(降级,不阻断 report 生成)。"""
+    if not titles:
+        return []
+    numbered = "\n".join(f"[{i+1}] {t}" for i, t in enumerate(titles))
+    prompt = f"翻译以下 {len(titles)} 个标题到中文:\n\n{numbered}"
+    try:
+        resp = ai_client.call_json(
+            prompt, system=_TRANSLATE_SYSTEM,
+            model=_TRANSLATE_MODEL, thinking_budget=0,
+        )
+    except Exception as e:
+        _log.warning("translate batch (%d 条) 失败: %s — 全部留空", len(titles), e)
+        return [""] * len(titles)
+    arr = parse_json_array(resp) or []
+    out = [""] * len(titles)
+    for i, t in enumerate(arr):
+        if i < len(titles) and isinstance(t, str):
+            out[i] = t.strip()
+    return out
+
+
+def _ensure_title_cn_for_manual(rows: list) -> list:
+    """对 title_cn 为空的"需人工"行批量翻译并写回 DB。
+
+    返回:重新 query 后的最新 rows(确保新翻译的 title_cn 反映在 row 字典里)。
+    若全都已翻译过,直接返回原 rows 不调 AI。
+    """
+    pending = [
+        r for r in rows
+        if (r["title"] or "").strip() and not (r["title_cn"] or "").strip()
+    ]
+    if not pending:
+        return rows
+
+    titles = [r["title"] for r in pending]
+    translations: list[str] = []
+    for i in range(0, len(titles), _TRANSLATE_BATCH_SIZE):
+        batch = titles[i : i + _TRANSLATE_BATCH_SIZE]
+        translations.extend(_translate_titles_batch(batch))
+
+    # 写回 DB(只写非空翻译,避免覆盖已有的占位数据)
+    with get_connection() as conn:
+        for row, cn in zip(pending, translations):
+            if cn:
+                conn.execute(
+                    "UPDATE raw_search_results SET title_cn=? WHERE id=?",
+                    (cn, row["id"]),
+                )
+
+    # 重读 — 确保返回的 rows 含最新 title_cn
+    return list(get_manual_followup())
 
 # 产品排序优先级:行号即 rank(1 = 最优先);外移到 rules/product_sort_order.txt
 _PRODUCT_RANKS: dict[str, int] = {
@@ -353,8 +424,8 @@ def _fill_sheet(ws, rows) -> None:
 def _sheet_manual(wb: Workbook) -> None:
     ws = wb.create_sheet("需人工跟进")
 
-    headers = ["标题", "URL", "添加日期"]
-    widths  = [46, 56, 14]
+    headers = ["标题", "中文翻译", "URL", "添加日期"]
+    widths  = [46, 38, 56, 14]
 
     ws.append(headers)
     for i, (cell, w) in enumerate(zip(ws[1], widths), 1):
@@ -366,14 +437,19 @@ def _sheet_manual(wb: Workbook) -> None:
     ws.row_dimensions[1].height = 28
     ws.freeze_panes = "A2"
 
-    rows = get_manual_followup()
+    # 批量翻译缺失的 title_cn(只翻译没翻过的,写回 DB,后续跑 report 不重复花钱)
+    rows = _ensure_title_cn_for_manual(get_manual_followup())
+
     alt = [
         PatternFill(start_color="F5F5F5", end_color="F5F5F5", fill_type="solid"),
         PatternFill(start_color="EBEBEB", end_color="EBEBEB", fill_type="solid"),
     ]
+    # URL 列在 4 列 schema 下是第 3 列
+    url_col_idx = 3
     for i, row in enumerate(rows):
         ws.append([_clean(v) for v in [
             row["title"] or "",
+            row["title_cn"] or "",
             row["source_url"] or "",
             (row["query_date"] or "")[:10],
         ]])
@@ -386,7 +462,7 @@ def _sheet_manual(wb: Workbook) -> None:
             cell.alignment = _WRAP
         ws.row_dimensions[ws.max_row].height = 36
         if row["source_url"]:
-            ws.cell(row=ws.max_row, column=2).hyperlink = row["source_url"]
+            ws.cell(row=ws.max_row, column=url_col_idx).hyperlink = row["source_url"]
 
     ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
 
