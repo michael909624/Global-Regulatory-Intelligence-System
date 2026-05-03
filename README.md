@@ -322,7 +322,6 @@ gris/
 ├── reporter.py          # 第 4 步:生成 Excel + ⚠️ 合成警告兜底显示
 ├── classify.py          # 影响等级分类(产品/市场标准化)
 ├── authority.py         # 监管机构权威度评分
-├── evaluate.py          # 评估/调试工具
 ├── ai_client.py         # Gemini 客户端封装(重试/退避/token 统计/成本估算)
 ├── seeds.py             # 启动时的种子法规库
 ├── database.py          # SQLite 数据库 schema + 查询 + 迁移
@@ -333,7 +332,6 @@ gris/
 ├── requirements.txt     # Python 依赖
 ├── prompts/             # 所有 LLM prompts(21 个独立文件,便于改写)
 ├── rules/               # 业务规则数据(法规别名、市场分级、导航词表等)
-├── tests/               # 召回率评测套件(含 5k/20k 合成池 + adversarial 注入测试)
 ├── .github/workflows/   # GitHub Actions 配置(run.yml)
 ├── data/                # 数据库
 ├── logs/                # 日志

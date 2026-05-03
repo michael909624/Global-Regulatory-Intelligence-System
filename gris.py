@@ -64,7 +64,6 @@ HELP = """
   init              初始化数据库（首次使用时运行）
 
   seed              注入种子源（已知权威源 URL 列表，保底召回）
-  evaluate          对照 tests/gold_set.json 黄金集计算召回率
 
 ━━━  典型工作流  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -634,11 +633,6 @@ def cmd_seed(_args: list[str]):
     run_seed_command()
 
 
-def cmd_evaluate(_args: list[str]):
-    from evaluate import run_evaluate_command
-    run_evaluate_command()
-
-
 # ── 交互菜单 ──────────────────────────────────────────────────────────────────
 
 # (command | None=separator, display description)
@@ -663,7 +657,6 @@ _MENU: list[tuple[str, str] | None] = [
     ("reset",    "清空数据  附加参数：--db  --reports（默认全部）"),
     ("init",     "初始化数据库（首次使用时运行）"),
     ("seed",     "注入种子源(已知权威源 URL 列表，保底召回)"),
-    ("evaluate", "对照黄金集计算召回率(tests/gold_set.json)"),
 ]
 
 _NUMBERED = [e for e in _MENU if e is not None]  # for index lookup
@@ -753,7 +746,6 @@ COMMANDS = {
     "reset":       cmd_reset,
     "init":        cmd_init,
     "seed":        cmd_seed,
-    "evaluate":    cmd_evaluate,
     "menu":        cmd_menu,
 }
 

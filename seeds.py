@@ -13,7 +13,6 @@ Seeds — 高权威源种子库。
   • 种子的真正用途:
       1. 占位去重 — researcher 之后若发现同 title hash 直接跳过,避免
          AI 又把这些入口页当作"新发现"重复入库
-      2. 黄金集评估 — evaluate.py 的 reg_hash 匹配会命中这些条目
 
 如何维护:
   • 每月抽 5 分钟,审查 SEEDS 里的链接是否仍可用。
@@ -175,7 +174,7 @@ def _purge_legacy_seed_artifacts(conn, raw_id: int) -> int:
 def inject_seeds() -> tuple[int, int]:
     """
     把所有 SEEDS 登记到 raw_search_results,priority='种子'、scrape_status='已抓取'。
-    种子不参与 scrape/analyze 流水线 — 仅作为占位去重 + 黄金集评估的标记。
+    种子不参与 scrape/analyze 流水线 — 仅作为占位去重的标记。
 
     幂等:重复调用会刷新已存在种子的 priority/status,并清掉早期版本遗留的
     scraped_content / compliance_analysis 污染数据。
@@ -236,7 +235,7 @@ def run_seed_command() -> None:
     print(f"\n  种子库共 {len(SEEDS)} 条权威源,正在登记...")
     new, refreshed = inject_seeds()
     print(f"\n  完成:新增 {new} 条,刷新 {refreshed} 条历史种子。")
-    print(f"  种子不参与抓取/分析 — 仅作为占位去重与黄金集评估的标记。\n")
+    print(f"  种子不参与抓取/分析 — 仅作为占位去重的标记。\n")
 
 
 if __name__ == "__main__":

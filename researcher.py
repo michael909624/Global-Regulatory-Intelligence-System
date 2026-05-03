@@ -604,7 +604,7 @@ def run_research(quick: bool = False, no_dynamic_discovery: bool = False) -> tup
     """
     init_db()
 
-    # 种子注入（保留旧逻辑，作为占位去重 + 黄金集标记）
+    # 种子注入（保留旧逻辑，作为占位去重标记）
     from seeds import inject_seeds, SEEDS
     seed_new, seed_refreshed = inject_seeds()
     print(f"\n  种子库：{len(SEEDS)} 条 → 新增 {seed_new}，刷新 {seed_refreshed}")
