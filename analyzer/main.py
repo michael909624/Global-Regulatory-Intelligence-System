@@ -119,8 +119,15 @@ def _llm_and_build(
     )
 
     try:
-        # 主分析是按 JSON 模板抽字段,不需要思考链 — 跟 triage/priority/dedup 看齐
-        text = ai_client.call_json(prompt, system=sys_prompt, thinking_budget=0)
+        # 主分析的字段抽取(requirement / dates / dimensions / products / markets)
+        # 是下游所有阶段的依赖,准确度优先于成本 — 用 Gemini 3.1 Pro + 适度 thinking,
+        # 把"结构化模板填空(flash 关 thinking)"升级为"理解 + 推断式抽取"。
+        # 法规原文复杂(条文嵌套/多义务并列)时,Pro + thinking 显著优于 flash。
+        text = ai_client.call_json(
+            prompt, system=sys_prompt,
+            model="gemini-3.1-pro-preview",
+            thinking_budget=2048,
+        )
     except Exception as e:
         _log.error("LLM call FAIL scraped_id=%d: %s", sc_id, e)
         return ("fail_temp", str(e))
