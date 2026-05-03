@@ -96,12 +96,21 @@ _DEDUP_SYSTEM = """你是法规情报系统的语义去重助手。
   - "Commission Delegated Regulation (EU) 2025/1535 supplementing 2024/2847" Delegated Act
   → 不合并：Delegated Act 是独立的法律文件，带具体技术细节
 
-❌ 例 5：相似主题但不同司法区
+❌ 例 5：相似主题但不同司法区(美国州)
   - "Washington State Right to Repair Act (HB 1392)"
   - "Texas Right to Repair Law (HB 1919)"
   → 不合并：不同州的不同法案，企业各州各自合规
 
+❌ 例 6：相似主题但不同欧洲国家(每国独立立法)
+  - "意大利电动滑板车强制三责险与牌照义务" [意大利]
+  - "西班牙电动滑板车强制登记与三责险" [西班牙]
+  - "法国电动滑板车强制责任险与年龄限制" [法国]
+  → 不合并：意/西/法各自国会独立立法,生效日 / 罚款金额 / 投保对象都不同。
+     **欧盟≠成员国国内法**,每国版本必须单独入库,各自带独立合规义务。
+
 # 关键约束
+- **affected_markets 不一致 → 不合(铁律)**。先看 [market] 列再看标题——市场不同就直接跳过,
+  标题再像也不合并。这是最容易踩的合并陷阱(同主题不同国家)。
 - 单组合并不超过 3 条（含 keeper）。看到 4+ 条"主题相似"→ 大概率是"同主题不同文件"陷阱，保留独立。
 - 仅在你**确定**两条是同一份文件时才合并。不确定就不合，宁愿留重复也不要错合。
 
@@ -197,6 +206,27 @@ def llm_dedup(rows_with_score: List[Tuple]) -> List[Tuple]:
                     and mid not in to_drop):
                 valid_merges.append(mid)
         if not valid_merges:
+            continue
+
+        # 硬护栏:同主题不同司法区是 LLM 最容易踩的陷阱(尤其 lite 模型仅看 title)。
+        # affected_markets 严格不一致 → 必是不同立法机构的不同文件,整组拒收。
+        # 例:意大利电滑保险 vs 西班牙电滑保险 → market 字段不同 → 拒收合并。
+        keeper_market = (rows_with_score[keeper][0].get("affected_markets") or "").strip()
+        market_mismatch = [
+            mid for mid in valid_merges
+            if (rows_with_score[mid][0].get("affected_markets") or "").strip() != keeper_market
+        ]
+        if market_mismatch:
+            keeper_title = (rows_with_score[keeper][0].get("title_cn")
+                            or rows_with_score[keeper][0].get("title") or "")[:40]
+            mismatched = ", ".join(
+                f"{mid}({(rows_with_score[mid][0].get('affected_markets') or '?')!r})"
+                for mid in market_mismatch
+            )
+            rejected_log.append(
+                f"  ⊘ 拒收跨市场合并: keeper={keeper}({keeper_title!r} [{keeper_market!r}]) "
+                f"vs {mismatched}"
+            )
             continue
 
         to_drop.update(valid_merges)
