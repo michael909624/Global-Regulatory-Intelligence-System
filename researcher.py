@@ -430,11 +430,15 @@ def _fetch_topic(
 ) -> tuple[list, list[dict]]:
     """对单议题发起 grounded 搜索，返回 (regs, sources)。"""
     prompt = _build_fetch_prompt(topic, quick, broaden)
+    # Gemini 3.1 Pro grounded — 复杂多议题查询规划显著强于 flash,直接关系召回率。
+    # 不传 thinking_budget(走默认全开):grounded search 受益于 thinking 来规划查询。
+    # 附加红利:Gemini 3 grounded 超额单价 $14/k(2.5 系列 $35/k),反而部分省钱。
     text, sources = ai_client.call_grounded(
         prompt,
         system=prompts.load("researcher_system").format(
             business_scope=_BUSINESS_SCOPE,
         ),
+        model="gemini-3.1-pro-preview",
         temperature=temperature,
     )
     regs = parse_json_array(text) or []
